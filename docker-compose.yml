@@ -1,0 +1,29 @@
+# Local development environment.
+#
+# First-time setup: copy the example environment file.
+#   cp .env.example .env
+# Then start both services:
+#   docker compose up --build
+#
+# Compose reads .env (which is git-ignored) and fails with a clear error if it is missing.
+
+services:
+  backend:
+    build: ./backend
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - /app/.venv
+
+  frontend:
+    build: ./frontend
+    env_file: .env
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      # Keep dependencies and build cache inside the container.
+      - /app/node_modules
+      - /app/.next
