@@ -1,16 +1,24 @@
 # Local development environment.
 #
-# First-time setup: copy the example environment file.
+# First-time setup: copy the example environment file and fill in real values.
 #   cp .env.example .env
 # Then start both services:
 #   docker compose up --build
 #
-# Compose reads .env (which is git-ignored) and fails with a clear error if it is missing.
+# Compose reads the root .env file (git-ignored) only for ${VAR} interpolation.
+# Each service receives exclusively the variables listed in its own `environment`
+# section, so backend secrets (e.g. DATABASE_URL) never reach the frontend container.
+# Required variables use ${VAR:?message} and stop Compose with a clear error when missing.
 
 services:
   backend:
     build: ./backend
-    env_file: .env
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:3000}
+      SUPABASE_URL: ${SUPABASE_URL:?SUPABASE_URL is required - set it in .env (see .env.example)}
+      SUPABASE_JWT_AUDIENCE: ${SUPABASE_JWT_AUDIENCE:-authenticated}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required - set it in .env (see .env.example)}
     ports:
       - "8000:8000"
     volumes:
@@ -19,7 +27,11 @@ services:
 
   frontend:
     build: ./frontend
-    env_file: .env
+    environment:
+      # Public values only: everything prefixed NEXT_PUBLIC_ is embedded in the browser bundle.
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api/v1}
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:?NEXT_PUBLIC_SUPABASE_URL is required - set it in .env (see .env.example)}
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:?NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is required - set it in .env (see .env.example)}
     ports:
       - "3000:3000"
     volumes:
