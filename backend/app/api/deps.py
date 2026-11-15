@@ -4,8 +4,9 @@ import logging
 from functools import lru_cache
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from psycopg_pool import ConnectionPool
 
 from app.core.config import settings
 from app.core.security import (
@@ -14,6 +15,7 @@ from app.core.security import (
     TokenVerifier,
     create_token_verifier,
 )
+from app.db.errors import DatabaseUnavailableError
 from app.models.auth import AuthenticatedUser
 
 logger = logging.getLogger(__name__)
@@ -64,6 +66,18 @@ def get_current_user(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=AUTH_UNAVAILABLE_DETAIL,
         ) from None
+
+
+def get_db_pool(request: Request) -> ConnectionPool:
+    """Return the process-wide connection pool created in the application lifespan.
+
+    It hands out the pool only; connections and transactions are managed by the
+    service layer, never by a request-scoped dependency.
+    """
+    pool: ConnectionPool | None = getattr(request.app.state, "db_pool", None)
+    if pool is None:
+        raise DatabaseUnavailableError("database unavailable (pool is not initialised)")
+    return pool
 
 
 CurrentUser = Annotated[AuthenticatedUser, Depends(get_current_user)]

@@ -8,6 +8,9 @@ import pytest
 # because Settings() is instantiated at import time and SUPABASE_URL is required.
 os.environ["SUPABASE_URL"] = "https://test-project.supabase.co"
 os.environ["SUPABASE_JWT_AUDIENCE"] = "authenticated"
+# Dummy value, never connected to: unit tests replace the pool. It is assigned (not
+# setdefault) so that a real DATABASE_URL from the shell or a .env file can never be used.
+os.environ["DATABASE_URL"] = "postgresql://skillloop_api.test:test-password@localhost:5432/postgres"
 
 from tests.auth_helpers import (
     JWKSServer,
