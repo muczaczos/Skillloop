@@ -1,4 +1,5 @@
 import os
+import time
 from collections.abc import Iterator
 
 import pytest
@@ -25,3 +26,24 @@ def jwks_server(signing_key: SigningKey) -> Iterator[JWKSServer]:
     with running_jwks_server() as server:
         server.publish(signing_key)
         yield server
+
+
+class FakeClock:
+    """Controllable replacement for time.monotonic (used for cache and cooldown timing)."""
+
+    def __init__(self) -> None:
+        self.now = time.monotonic()
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    """Freeze time.monotonic so tests can move past cache lifespan / cooldown instantly."""
+    fake = FakeClock()
+    monkeypatch.setattr(time, "monotonic", fake)
+    return fake

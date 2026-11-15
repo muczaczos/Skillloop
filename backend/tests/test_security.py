@@ -1,11 +1,18 @@
 """Unit tests for Supabase access token verification (app.core.security)."""
 
+import json
 import time
 import uuid
 
 import pytest
 
-from app.core.security import AuthServiceUnavailableError, InvalidTokenError
+from app.core.config import Settings
+from app.core.security import (
+    JWKS_FAILURE_BACKOFF_SECONDS,
+    AuthServiceUnavailableError,
+    InvalidTokenError,
+    create_token_verifier,
+)
 from tests.auth_helpers import (
     JWKSServer,
     SigningKey,
@@ -16,6 +23,7 @@ from tests.auth_helpers import (
     make_verifier,
     running_jwks_server,
 )
+from tests.conftest import FakeClock
 
 # --- Valid tokens ---
 
@@ -257,3 +265,245 @@ def test_empty_jwks_raises_service_unavailable(
 
     with pytest.raises(AuthServiceUnavailableError):
         make_verifier(jwks_server.url).verify(make_token(signing_key))
+
+
+# --- JWKS failures are 503-class (AuthServiceUnavailableError), never "invalid token" ---
+
+_KEY_WITHOUT_KID = {"kty": "EC", "crv": "P-256", "x": "AAAA", "y": "AAAA"}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"<html><body>502 Bad Gateway</body></html>",
+        b"",
+        b"{not json",
+        b"\xff\xfe\x00 not utf-8",
+        b"[]",
+        b"null",
+        b'"keys"',
+        b'{"keys": []}',
+        b'{"keys": "oops"}',
+        b'{"other": 1}',
+        b'{"keys": [{"kty": "EC", "kid": "unusable"}]}',
+        json.dumps({"keys": [_KEY_WITHOUT_KID]}).encode(),
+    ],
+    ids=[
+        "html",
+        "empty",
+        "invalid-json",
+        "invalid-utf8",
+        "array",
+        "null",
+        "string",
+        "empty-keys",
+        "keys-not-a-list",
+        "no-keys-member",
+        "unusable-key",
+        "key-without-kid",
+    ],
+)
+def test_broken_jwks_document_raises_service_unavailable(
+    jwks_server: JWKSServer, signing_key: SigningKey, body: bytes
+) -> None:
+    jwks_server.raw_body = body
+
+    with pytest.raises(AuthServiceUnavailableError):
+        make_verifier(jwks_server.url).verify(make_token(signing_key))
+
+
+@pytest.mark.parametrize(
+    "unusable_for_signing",
+    [
+        lambda jwk: {k: v for k, v in jwk.items() if k != "kid"},
+        lambda jwk: {**jwk, "use": "enc"},
+    ],
+    ids=["valid-key-without-kid", "valid-key-with-use-enc"],
+)
+def test_jwks_with_valid_keys_but_none_usable_for_signing_raises_service_unavailable(
+    jwks_server: JWKSServer, signing_key: SigningKey, unusable_for_signing
+) -> None:
+    # Parsed successfully by PyJWT, but filtered out by get_signing_keys() ("no signing keys").
+    jwks_server.keys = [unusable_for_signing(signing_key.public_jwk())]
+
+    with pytest.raises(AuthServiceUnavailableError):
+        make_verifier(jwks_server.url).verify(make_token(signing_key))
+
+
+@pytest.mark.parametrize("status", [404, 500, 502, 503, 302])
+def test_jwks_http_error_status_raises_service_unavailable(
+    jwks_server: JWKSServer, signing_key: SigningKey, status: int
+) -> None:
+    jwks_server.status = status
+
+    with pytest.raises(AuthServiceUnavailableError):
+        make_verifier(jwks_server.url).verify(make_token(signing_key))
+
+
+@pytest.mark.parametrize("behavior", ["truncate", "reset"])
+def test_interrupted_jwks_response_raises_service_unavailable(
+    jwks_server: JWKSServer, signing_key: SigningKey, behavior: str
+) -> None:
+    jwks_server.behavior = behavior
+
+    with pytest.raises(AuthServiceUnavailableError):
+        make_verifier(jwks_server.url).verify(make_token(signing_key))
+
+
+def test_unavailable_error_message_has_class_name_only(
+    jwks_server: JWKSServer, signing_key: SigningKey
+) -> None:
+    jwks_server.raw_body = b"secret-looking {garbage"
+
+    with pytest.raises(AuthServiceUnavailableError) as exc_info:
+        make_verifier(jwks_server.url).verify(make_token(signing_key))
+
+    assert str(exc_info.value) == "signing keys could not be loaded (JSONDecodeError)"
+
+
+def test_unknown_kid_with_valid_jwks_is_invalid_token_not_unavailable(
+    jwks_server: JWKSServer,
+) -> None:
+    token = make_token(SigningKey(kid="not-published"))
+
+    with pytest.raises(InvalidTokenError):
+        make_verifier(jwks_server.url).verify(token)
+
+
+def test_failed_refresh_after_unknown_kid_is_unavailable_not_invalid_token(
+    jwks_server: JWKSServer, signing_key: SigningKey, clock: FakeClock
+) -> None:
+    # A failing refresh triggered by an unknown kid is a JWKS problem (503), not a bad token.
+    verifier = make_verifier(jwks_server.url)
+    verifier.verify(make_token(signing_key))
+    clock.advance(31)  # cooldown elapsed, so the unknown kid triggers a refresh
+    jwks_server.raw_body = b"<html>"
+
+    with pytest.raises(AuthServiceUnavailableError):
+        verifier.verify(make_token(SigningKey(kid="not-published")))
+
+
+# --- Cache behaviour during JWKS outages ---
+
+
+def test_warm_cache_keeps_working_during_jwks_outage(
+    jwks_server: JWKSServer, signing_key: SigningKey, clock: FakeClock
+) -> None:
+    verifier = make_verifier(jwks_server.url)
+    verifier.verify(make_token(signing_key))
+    jwks_server.status = 500
+    clock.advance(299)  # still inside the 300 s lifespan
+
+    verifier.verify(make_token(signing_key))
+
+    assert jwks_server.request_count == 1
+
+
+def test_expired_cache_and_failed_refresh_raises_service_unavailable(
+    jwks_server: JWKSServer, signing_key: SigningKey, clock: FakeClock
+) -> None:
+    verifier = make_verifier(jwks_server.url)
+    verifier.verify(make_token(signing_key))
+    jwks_server.status = 500
+    clock.advance(301)  # cache expired; expired keys must not be served (no stale-on-error)
+
+    with pytest.raises(AuthServiceUnavailableError):
+        verifier.verify(make_token(signing_key))
+
+    assert jwks_server.request_count == 2
+
+
+def test_service_recovers_after_jwks_returns(
+    jwks_server: JWKSServer, signing_key: SigningKey, clock: FakeClock
+) -> None:
+    verifier = make_verifier(jwks_server.url)
+    verifier.verify(make_token(signing_key))
+    jwks_server.status = 500
+    clock.advance(301)
+    with pytest.raises(AuthServiceUnavailableError):
+        verifier.verify(make_token(signing_key))
+
+    jwks_server.status = 200
+    clock.advance(JWKS_FAILURE_BACKOFF_SECONDS + 1)
+
+    verifier.verify(make_token(signing_key))
+
+
+def test_failed_downloads_are_not_retried_during_backoff(
+    jwks_server: JWKSServer, signing_key: SigningKey, clock: FakeClock
+) -> None:
+    verifier = make_verifier(jwks_server.url)
+    verifier.verify(make_token(signing_key))
+    jwks_server.status = 500
+    clock.advance(301)
+
+    for _ in range(10):
+        with pytest.raises(AuthServiceUnavailableError):
+            verifier.verify(make_token(signing_key))
+
+    assert jwks_server.request_count == 2  # initial fetch + one failed refresh
+
+
+def test_random_kids_during_outage_cause_a_single_download_attempt(
+    jwks_server: JWKSServer, signing_key: SigningKey, clock: FakeClock
+) -> None:
+    verifier = make_verifier(jwks_server.url)
+    verifier.verify(make_token(signing_key))  # warm cache
+    clock.advance(31)  # PyJWT cooldown elapsed, so unknown kids would force refreshes
+    jwks_server.status = 500
+
+    for _ in range(10):
+        with pytest.raises(AuthServiceUnavailableError):
+            verifier.verify(make_token(SigningKey(kid=f"random-{uuid.uuid4()}")))
+
+    assert jwks_server.request_count == 2
+
+
+def test_backoff_does_not_block_tokens_served_from_valid_cache(
+    jwks_server: JWKSServer, signing_key: SigningKey, clock: FakeClock
+) -> None:
+    verifier = make_verifier(jwks_server.url)
+    verifier.verify(make_token(signing_key))
+    clock.advance(31)
+    jwks_server.status = 500
+    with pytest.raises(AuthServiceUnavailableError):
+        verifier.verify(make_token(SigningKey(kid="random")))  # starts the backoff
+
+    verifier.verify(make_token(signing_key))  # known kid, valid cache
+
+
+# --- Key rotation and cooldown ---
+
+
+def test_rotated_key_is_rejected_inside_cooldown_and_accepted_after_it(
+    jwks_server: JWKSServer, signing_key: SigningKey, clock: FakeClock
+) -> None:
+    verifier = make_verifier(jwks_server.url, cooldown_seconds=30)
+    verifier.verify(make_token(signing_key))
+    new_key = SigningKey(kid="rotated-key")
+    jwks_server.publish(signing_key, new_key)
+
+    clock.advance(29)
+    with pytest.raises(InvalidTokenError):
+        verifier.verify(make_token(new_key))
+    assert jwks_server.request_count == 1  # no refresh inside the cooldown
+
+    clock.advance(2)  # 31 s since the last successful fetch
+    verifier.verify(make_token(new_key))
+    assert jwks_server.request_count == 2
+
+
+# --- Production configuration ---
+
+
+def test_production_verifier_uses_expected_jwks_client_settings() -> None:
+    settings = Settings(supabase_url="https://abc.supabase.co")
+
+    client = create_token_verifier(settings)._jwks_client
+
+    assert client.uri == "https://abc.supabase.co/auth/v1/.well-known/jwks.json"
+    assert client.timeout == 5
+    assert client.jwk_set_cache is not None
+    assert client.jwk_set_cache.lifespan == 300
+    assert client.cooldown_duration == 30
+    assert client._failure_backoff_seconds == JWKS_FAILURE_BACKOFF_SECONDS

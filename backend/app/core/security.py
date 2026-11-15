@@ -11,16 +11,14 @@ Security notes:
   part of it, so they are safe to log.
 """
 
+import http.client
+import time
+from typing import Any
 from uuid import UUID
 
 import jwt
-from jwt import PyJWKClient
-from jwt.exceptions import (
-    PyJWKClientConnectionError,
-    PyJWKClientError,
-    PyJWKSetError,
-    PyJWTError,
-)
+from jwt import PyJWK, PyJWKClient
+from jwt.exceptions import PyJWKClientError, PyJWTError
 
 from app.core.config import Settings
 from app.models.auth import AuthenticatedUser
@@ -39,6 +37,16 @@ JWKS_CACHE_LIFESPAN_SECONDS = 300
 # as a standby key before rotation, which is Supabase's recommended procedure).
 JWKS_REFRESH_COOLDOWN_SECONDS = 30
 JWKS_FETCH_TIMEOUT_SECONDS = 5
+# After a failed JWKS download no new download is attempted for this long. PyJWT's
+# own cooldown only starts after a *successful* fetch, so without this, every request
+# would retry (and wait up to the fetch timeout) while the endpoint is down.
+JWKS_FAILURE_BACKOFF_SECONDS = 10
+
+# Everything that can go wrong while downloading or parsing a JWKS document:
+# PyJWT errors (connection, empty or malformed key set), transport errors such as
+# connection resets (OSError), invalid JSON / encoding (ValueError, which covers
+# JSONDecodeError and UnicodeDecodeError) and HTTP protocol errors.
+_JWKS_FAILURES = (PyJWTError, OSError, ValueError, http.client.HTTPException)
 
 
 class InvalidTokenError(Exception):
@@ -49,10 +57,58 @@ class AuthServiceUnavailableError(Exception):
     """The signing keys could not be obtained, so no token can be verified."""
 
 
+class JWKSUnavailableError(Exception):
+    """The JWKS could not be downloaded or is unusable (a server-side problem).
+
+    Deliberately not a PyJWTError: PyJWKClientError is also raised for an unknown
+    "kid", so the two situations are told apart by exception type, not by message.
+    """
+
+
+class SupabaseJWKClient(PyJWKClient):
+    """PyJWKClient with typed JWKS failures and a backoff after failed downloads.
+
+    - Any failure to obtain or parse the key set raises JWKSUnavailableError.
+      Hence the only PyJWKClientError left to escape get_signing_key() means
+      "the JWKS is fine, but contains no key with this kid".
+    - Cache policy is unchanged: keys from a valid cache are used, an expired cache
+      that cannot be refreshed is an error (expired keys are never served).
+    """
+
+    def __init__(
+        self,
+        uri: str,
+        *,
+        failure_backoff_seconds: float = JWKS_FAILURE_BACKOFF_SECONDS,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(uri, **kwargs)
+        self._failure_backoff_seconds = failure_backoff_seconds
+        self._retry_after: float | None = None
+
+    def fetch_data(self) -> Any:
+        # Only called when a network request is needed (cache miss, expiry or forced refresh).
+        if self._retry_after is not None and time.monotonic() < self._retry_after:
+            raise JWKSUnavailableError("JWKS download skipped after a recent failure")
+        try:
+            data = super().fetch_data()
+        except _JWKS_FAILURES as exc:
+            self._retry_after = time.monotonic() + self._failure_backoff_seconds
+            raise JWKSUnavailableError("JWKS download failed") from exc
+        self._retry_after = None
+        return data
+
+    def get_signing_keys(self, refresh: bool = False) -> list[PyJWK]:
+        try:
+            return super().get_signing_keys(refresh)
+        except _JWKS_FAILURES as exc:  # e.g. no usable signing keys, invalid cached set
+            raise JWKSUnavailableError("JWKS is unusable") from exc
+
+
 class TokenVerifier:
     """Verifies Supabase access tokens and extracts the authenticated user."""
 
-    def __init__(self, *, jwks_client: PyJWKClient, issuer: str, audience: str) -> None:
+    def __init__(self, *, jwks_client: SupabaseJWKClient, issuer: str, audience: str) -> None:
         self._jwks_client = jwks_client
         self._issuer = issuer
         self._audience = audience
@@ -99,13 +155,17 @@ class TokenVerifier:
             raise InvalidTokenError("token has no key id")
         return kid
 
-    def _get_signing_key(self, kid: str) -> jwt.PyJWK:
+    def _get_signing_key(self, kid: str) -> PyJWK:
         try:
             return self._jwks_client.get_signing_key(kid)
-        except (PyJWKClientConnectionError, PyJWKSetError) as exc:
-            # Checked before PyJWKClientError, which is the base class of the connection error.
-            raise AuthServiceUnavailableError("signing keys could not be loaded") from exc
+        except JWKSUnavailableError as exc:
+            cause = exc.__cause__ if exc.__cause__ is not None else exc
+            # Only the exception class name is included: it is safe to log and useful to debug.
+            raise AuthServiceUnavailableError(
+                f"signing keys could not be loaded ({type(cause).__name__})"
+            ) from exc
         except PyJWKClientError as exc:
+            # JWKSUnavailableError covers every JWKS problem, so this is an unknown "kid".
             raise InvalidTokenError("token key id is unknown") from exc
 
     @staticmethod
@@ -123,7 +183,7 @@ def create_token_verifier(settings: Settings) -> TokenVerifier:
 
     No network request is made here; keys are fetched on first use.
     """
-    jwks_client = PyJWKClient(
+    jwks_client = SupabaseJWKClient(
         settings.supabase_jwks_url,
         cache_jwk_set=True,
         lifespan=JWKS_CACHE_LIFESPAN_SECONDS,

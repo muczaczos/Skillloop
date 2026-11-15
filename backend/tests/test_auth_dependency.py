@@ -111,3 +111,54 @@ def test_unreachable_jwks_returns_503(signing_key: SigningKey) -> None:
 
     assert response.status_code == 503
     assert response.json() == {"detail": AUTH_UNAVAILABLE_DETAIL}
+
+
+@pytest.mark.parametrize(
+    ("setup", "label"),
+    [
+        (lambda server: setattr(server, "raw_body", b"<html>bad gateway</html>"), "html"),
+        (lambda server: setattr(server, "raw_body", b""), "empty"),
+        (lambda server: setattr(server, "raw_body", b"[]"), "not-an-object"),
+        (lambda server: setattr(server, "raw_body", b'{"keys": []}'), "empty-keys"),
+        (lambda server: setattr(server, "behavior", "reset"), "connection-reset"),
+        (lambda server: setattr(server, "status", 500), "http-500"),
+    ],
+)
+def test_jwks_failures_return_503_with_generic_body(
+    jwks_server: JWKSServer, signing_key: SigningKey, setup, label: str
+) -> None:
+    setup(jwks_server)
+
+    with TestClient(build_app(jwks_server.url)) as client:
+        token = make_token(signing_key)
+        response = client.get("/protected", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 503, label
+    assert response.json() == {"detail": AUTH_UNAVAILABLE_DETAIL}
+
+
+@pytest.mark.parametrize(
+    "unusable_for_signing",
+    [
+        lambda jwk: {k: v for k, v in jwk.items() if k != "kid"},
+        lambda jwk: {**jwk, "use": "enc"},
+    ],
+    ids=["valid-key-without-kid", "valid-key-with-use-enc"],
+)
+def test_jwks_with_valid_keys_but_none_usable_for_signing_returns_503(
+    jwks_server: JWKSServer, signing_key: SigningKey, unusable_for_signing
+) -> None:
+    jwks_server.keys = [unusable_for_signing(signing_key.public_jwk())]
+
+    with TestClient(build_app(jwks_server.url)) as client:
+        token = make_token(signing_key)
+        response = client.get("/protected", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": AUTH_UNAVAILABLE_DETAIL}
+
+
+def test_unknown_kid_with_valid_jwks_returns_401(client: TestClient) -> None:
+    token = make_token(SigningKey(kid="not-published"))
+
+    assert_unauthorized(client.get("/protected", headers={"Authorization": f"Bearer {token}"}))

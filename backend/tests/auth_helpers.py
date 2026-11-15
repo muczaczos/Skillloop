@@ -8,6 +8,8 @@ import base64
 import hashlib
 import hmac
 import json
+import socket
+import struct
 import threading
 import time
 import uuid
@@ -20,10 +22,9 @@ from typing import Any
 import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from jwt import PyJWKClient
 from jwt.algorithms import ECAlgorithm
 
-from app.core.security import TokenVerifier
+from app.core.security import JWKS_FAILURE_BACKOFF_SECONDS, SupabaseJWKClient, TokenVerifier
 
 TEST_SUPABASE_URL = "https://test-project.supabase.co"
 TEST_ISSUER = f"{TEST_SUPABASE_URL}/auth/v1"
@@ -105,11 +106,19 @@ def make_hs256_token_with_public_key(key: SigningKey, claims: dict[str, Any]) ->
 
 
 class JWKSServer:
-    """Minimal local HTTP server publishing a mutable JWKS document."""
+    """Minimal local HTTP server publishing a mutable JWKS document.
+
+    Failure modes for tests: `status` (HTTP status), `raw_body` (replaces the JSON
+    document, e.g. HTML or garbage bytes) and `behavior` ("truncate" sends fewer bytes
+    than announced, "reset" aborts the connection with a TCP RST mid-response).
+    """
 
     def __init__(self) -> None:
         self.keys: list[dict[str, Any]] = []
         self.request_count = 0
+        self.status = 200
+        self.raw_body: bytes | None = None
+        self.behavior = "normal"
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -118,12 +127,30 @@ class JWKSServer:
                     self.send_error(404)
                     return
                 outer.request_count += 1
-                body = json.dumps({"keys": outer.keys}).encode()
-                self.send_response(200)
+                body = (
+                    outer.raw_body
+                    if outer.raw_body is not None
+                    else json.dumps({"keys": outer.keys}).encode()
+                )
+                self.send_response(outer.status)
                 self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
+                if outer.behavior == "normal":
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                # Announce more bytes than are sent, then drop the connection.
+                self.send_header("Content-Length", str(len(body) + 100))
                 self.end_headers()
-                self.wfile.write(body)
+                self.wfile.write(body[: len(body) // 2])
+                self.wfile.flush()
+                if outer.behavior == "reset":
+                    # SO_LINGER with a zero timeout makes close() send RST instead of FIN.
+                    self.connection.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                    )
+                self.close_connection = True
+                self.connection.close()
 
             def log_message(self, format: str, *args: Any) -> None:
                 pass  # keep test output clean
@@ -159,12 +186,19 @@ def running_jwks_server() -> Iterator[JWKSServer]:
         server.stop()
 
 
-def make_verifier(jwks_url: str, *, cooldown_seconds: float = 30) -> TokenVerifier:
-    client = PyJWKClient(
+def make_verifier(
+    jwks_url: str,
+    *,
+    cooldown_seconds: float = 30,
+    lifespan_seconds: float = 300,
+    failure_backoff_seconds: float = JWKS_FAILURE_BACKOFF_SECONDS,
+) -> TokenVerifier:
+    client = SupabaseJWKClient(
         jwks_url,
         cache_jwk_set=True,
-        lifespan=300,
+        lifespan=lifespan_seconds,
         timeout=2,
         cooldown_duration=cooldown_seconds,
+        failure_backoff_seconds=failure_backoff_seconds,
     )
     return TokenVerifier(jwks_client=client, issuer=TEST_ISSUER, audience=TEST_AUDIENCE)
