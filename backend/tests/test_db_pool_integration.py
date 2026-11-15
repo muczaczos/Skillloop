@@ -6,38 +6,27 @@ instead of connecting, so these tests can never touch a remote project.
 Optional TEST_DATABASE_ADMIN_URL (local postgres login) enables the wrong-role test.
 """
 
-import os
 from collections.abc import Iterator
-from urllib.parse import urlsplit
 
 import psycopg
 import pytest
 from psycopg_pool import ConnectionPool
 
-from app.db.pool import ConnectionStateError, configure_connection, create_pool
-from tests.test_config import make_settings
-
-LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "host.docker.internal"}
-TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
-TEST_DATABASE_ADMIN_URL = os.environ.get("TEST_DATABASE_ADMIN_URL")
+from app.db.pool import ConnectionStateError, configure_connection
+from tests.db_integration_helpers import (
+    TEST_DATABASE_ADMIN_URL,
+    TEST_DATABASE_URL,
+    assert_local,
+    open_api_pool,
+)
 
 pytestmark = pytest.mark.skipif(not TEST_DATABASE_URL, reason="TEST_DATABASE_URL is not set")
 
 
-def assert_local(url: str) -> None:
-    host = urlsplit(url).hostname
-    if host not in LOCAL_HOSTS:
-        pytest.fail(f"refusing to run database tests against a non-local host: {host!r}")
-
-
 @pytest.fixture
 def pool() -> Iterator[ConnectionPool]:
-    assert TEST_DATABASE_URL
-    assert_local(TEST_DATABASE_URL)
     # One connection only, so every checkout reuses the same server session.
-    settings = make_settings(database_url=TEST_DATABASE_URL, db_pool_min_size=1, db_pool_max_size=1)
-    pool = create_pool(settings)
-    pool.open(wait=True, timeout=10)
+    pool = open_api_pool(max_size=1)
     try:
         yield pool
     finally:
