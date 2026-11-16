@@ -21,6 +21,9 @@ LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "host.docker.internal"}
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 TEST_DATABASE_ADMIN_URL = os.environ.get("TEST_DATABASE_ADMIN_URL")
 
+# Throwaway users created by the `users` fixture (see conftest.py).
+USER_COUNT = 4
+
 
 def assert_local(url: str) -> None:
     host = urlsplit(url).hostname

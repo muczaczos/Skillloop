@@ -6,9 +6,7 @@ users are created in auth.users (the trigger gives each a profile) and deleted a
 
 import json
 import threading
-from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from uuid import uuid4
 
 import psycopg
 import pytest
@@ -25,6 +23,7 @@ from app.models.auth import AuthenticatedUser
 from tests.db_integration_helpers import (
     TEST_DATABASE_ADMIN_URL,
     TEST_DATABASE_URL,
+    USER_COUNT,
     assert_local,
     open_api_pool,
 )
@@ -34,43 +33,9 @@ pytestmark = pytest.mark.skipif(
     reason="TEST_DATABASE_URL and TEST_DATABASE_ADMIN_URL are not both set",
 )
 
-USER_COUNT = 4
-
 
 class BlockError(Exception):
     pass
-
-
-@pytest.fixture
-def admin() -> Iterator[psycopg.Connection]:
-    assert TEST_DATABASE_ADMIN_URL
-    assert_local(TEST_DATABASE_ADMIN_URL)
-    with psycopg.connect(TEST_DATABASE_ADMIN_URL, autocommit=True) as conn:
-        yield conn
-
-
-@pytest.fixture
-def users(admin: psycopg.Connection) -> Iterator[list[AuthenticatedUser]]:
-    created = [AuthenticatedUser(id=uuid4()) for _ in range(USER_COUNT)]
-    for user in created:
-        admin.execute(
-            "insert into auth.users (id, email) values (%s, %s)",
-            [user.id, f"{user.id}@session-test.example"],
-        )
-    try:
-        yield created
-    finally:
-        # Cascades to the profiles created by the trigger.
-        admin.execute("delete from auth.users where id = any(%s)", [[u.id for u in created]])
-
-
-@pytest.fixture
-def pool() -> Iterator[ConnectionPool]:
-    pool = open_api_pool(max_size=1)
-    try:
-        yield pool
-    finally:
-        pool.close()
 
 
 def _display_name(admin: psycopg.Connection, user: AuthenticatedUser) -> str | None:
