@@ -674,3 +674,46 @@ def test_the_old_detail_shape_is_gone(vclient: TestClient) -> None:
     body = vclient.post("/goals", json={}).json()
 
     assert "detail" not in body and list(body) == ["error"]
+
+
+# --- the fallback name of _validation_detail ------------------------------------------------
+# FastAPI always starts a location with body/query/path/header/cookie, so these branches are
+# not reachable through a request; the function still has to behave when called directly.
+
+
+def _field_of(error: dict[str, Any]) -> str:
+    return api_errors._validation_detail(error)["field"]
+
+
+def test_an_error_without_any_location_is_named_body() -> None:
+    assert api_errors._validation_detail({"loc": (), "type": "missing"}) == {
+        "field": "body",
+        "message": "This field is required.",
+    }
+    assert _field_of({"type": "missing"}) == "body"  # no `loc` key at all
+    assert _field_of({"loc": ("",), "type": "missing"}) == "body"  # a nameless segment
+
+
+def test_an_unknown_location_prefix_is_kept_as_part_of_the_path() -> None:
+    # "weird" is not a known location, so it is not stripped: the "body" fallback is only for
+    # an EMPTY path. The field is still named, and the message still comes from the table.
+    assert api_errors._validation_detail({"loc": ("weird", "x"), "type": "missing"}) == {
+        "field": "weird.x",
+        "message": "This field is required.",
+    }
+    assert _field_of({"loc": ("weird",), "type": "missing"}) == "weird"
+
+
+@pytest.mark.parametrize(
+    ("loc", "field"),
+    [
+        (("body",), "body"),
+        (("query",), "query"),  # a known location with nothing after it names the location
+        (("header", "x-token"), "x-token"),
+        (("body", "lines", 1, "qty"), "lines.1.qty"),
+    ],
+)
+def test_known_locations_are_stripped_and_a_bare_location_names_itself(
+    loc: tuple[Any, ...], field: str
+) -> None:
+    assert _field_of({"loc": loc, "type": "missing"}) == field
