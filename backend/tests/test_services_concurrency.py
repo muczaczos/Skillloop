@@ -195,6 +195,38 @@ def test_1_two_parallel_creates_one_wins(
     assert career_goal_service.get_active_goal(pool4, user) == created[0]
 
 
+# --- 1b. create while another create transaction is open ---------------------------------
+
+
+def test_1b_create_waits_for_open_create_then_active_goal_exists(
+    pool4: ConnectionPool, users: list[AuthenticatedUser], admin: psycopg.Connection
+) -> None:
+    user = users[0]
+
+    with held_transaction(
+        pool4,
+        user,
+        lambda conn: career_goals.insert(
+            conn, user.id, target_role="Backend Engineer", seniority="mid", description="API"
+        ),
+    ) as held:
+        executor, future = start_waiter(
+            lambda: career_goal_service.create_goal(pool4, user, CREATE)
+        )
+        with executor:
+            wait_until_blocked_by(admin, held.pid)
+            assert not future.done()
+            held.release()
+            with pytest.raises(ActiveGoalExistsError) as exc_info:
+                future.result(timeout=TIMEOUT)
+
+    # The loser was stopped by the database constraint, not by a check made beforehand.
+    cause = exc_info.value.__cause__
+    assert isinstance(cause, psycopg.errors.UniqueViolation)
+    assert cause.diag.constraint_name == "one_active_goal_per_user"
+    assert admin_active_count(admin, user) == 1
+
+
 # --- 2. update while an archive transaction is open --------------------------------------
 
 
@@ -240,6 +272,32 @@ def test_3_two_parallel_archives_one_wins(
     refused = [r for r in results if isinstance(r, GoalArchivedError)]
     assert len(archived) == 1 and len(refused) == 1, results
     assert archived[0].status == "archived"
+    assert admin_active_count(admin, user) == 0
+
+
+# --- 3b. archive while another archive transaction is open -------------------------------
+
+
+def test_3b_archive_waits_for_open_archive_then_goal_archived(
+    pool4: ConnectionPool, users: list[AuthenticatedUser], admin: psycopg.Connection
+) -> None:
+    user = users[0]
+    goal = new_goal(pool4, user)
+
+    with held_transaction(
+        pool4, user, lambda conn: career_goals.archive_active(conn, user.id, goal.id)
+    ) as held:
+        executor, future = start_waiter(
+            lambda: career_goal_service.archive_goal(pool4, user, goal.id)
+        )
+        with executor:
+            wait_until_blocked_by(admin, held.pid)
+            assert not future.done()
+            held.release()
+            with pytest.raises(GoalArchivedError):
+                future.result(timeout=TIMEOUT)
+
+    assert admin_rows(admin, user) == [("Backend Engineer", "mid", "API", "archived")]
     assert admin_active_count(admin, user) == 0
 
 
