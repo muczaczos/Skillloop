@@ -12,6 +12,10 @@ What is handled:
 - DatabaseUnavailableError: 503.
 - psycopg.Error: mapped by SQLSTATE (see _map_database_error). Anything not listed there is
   a bug or an unexpected failure: 500, never a client error.
+- HTTPException (FastAPI's and Starlette's: the authentication dependency, unknown paths,
+  wrong methods): the status is kept; the code and the message come from a fixed table by
+  status, never from the exception's `detail`, which could hold anything. Only a short list
+  of headers is passed on (see _FORWARDED_HEADERS).
 
 The unique violation of one_active_goal_per_user is mapped to ActiveGoalExistsError by
 career_goal_service.create_goal(). It is deliberately NOT mapped again here: every 23505
@@ -31,6 +35,7 @@ from uuid import uuid4
 import psycopg
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.errors import AppError
 from app.db.errors import DatabaseUnavailableError
@@ -44,6 +49,10 @@ CONFLICT_MESSAGE = "The request conflicts with the current state of the resource
 VALIDATION_ERROR_MESSAGE = "The submitted data is invalid."
 SERVICE_UNAVAILABLE_MESSAGE = "The service is temporarily unavailable. Please try again later."
 DATABASE_TIMEOUT_MESSAGE = "The database did not answer in time. Please try again later."
+FORBIDDEN_MESSAGE = "You do not have permission to perform this action."
+NOT_FOUND_MESSAGE = "The requested resource was not found."
+METHOD_NOT_ALLOWED_MESSAGE = "This method is not allowed for the requested resource."
+CLIENT_ERROR_MESSAGE = "The request could not be processed."
 
 # career_goals.user_id -> auth.users(id): the token is valid but its user no longer exists.
 USER_FK_CONSTRAINT = "career_goals_user_id_fkey"
@@ -60,6 +69,21 @@ _CLIENT_DATA_SQLSTATES = frozenset(
         "22021",  # character_not_in_repertoire (invalid byte sequence for the encoding)
     }
 )
+
+
+# HTTPException statuses with their own code and message. Every other status below 500 is a
+# CLIENT_ERROR and every other one an INTERNAL_ERROR, each with a generic message.
+_HTTP_STATUS_ERRORS: dict[int, tuple[str, str]] = {
+    401: ("UNAUTHORIZED", UNAUTHORIZED_MESSAGE),
+    403: ("FORBIDDEN", FORBIDDEN_MESSAGE),
+    404: ("NOT_FOUND", NOT_FOUND_MESSAGE),
+    405: ("METHOD_NOT_ALLOWED", METHOD_NOT_ALLOWED_MESSAGE),
+    503: ("SERVICE_UNAVAILABLE", SERVICE_UNAVAILABLE_MESSAGE),
+}
+
+# Headers of an HTTPException that are passed on to the client (lower case). Anything else
+# (cookies, internal headers) is dropped.
+_FORWARDED_HEADERS = frozenset({"www-authenticate", "allow", "retry-after"})
 
 
 @dataclass(frozen=True)
@@ -84,6 +108,22 @@ def _map_database_error(sqlstate: str | None, constraint: str | None) -> ErrorSp
     # 23505, 23514, 23502, 42501, other 22xxx, and every other psycopg error: our bug or an
     # unexpected failure, not something the client can fix.
     return ErrorSpec(500, "INTERNAL_ERROR", INTERNAL_ERROR_MESSAGE)
+
+
+def _map_http_exception(exc: StarletteHTTPException) -> ErrorSpec:
+    headers = {
+        name: value
+        for name, value in (exc.headers or {}).items()
+        if name.lower() in _FORWARDED_HEADERS
+    }
+    known = _HTTP_STATUS_ERRORS.get(exc.status_code)
+    if known is not None:
+        code, message = known
+    elif exc.status_code >= 500:
+        code, message = "INTERNAL_ERROR", INTERNAL_ERROR_MESSAGE
+    else:
+        code, message = "CLIENT_ERROR", CLIENT_ERROR_MESSAGE
+    return ErrorSpec(exc.status_code, code, message, headers or None)
 
 
 def _body(spec: ErrorSpec, request_id: str) -> dict[str, dict[str, str]]:
@@ -133,7 +173,18 @@ async def database_error_handler(request: Request, exc: Exception) -> JSONRespon
     return _respond(spec, request_id)
 
 
+async def http_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    assert isinstance(exc, StarletteHTTPException)
+    request_id = str(uuid4())
+    spec = _map_http_exception(exc)
+    # Neither `detail` nor the request path is logged: both can carry data.
+    level = logging.ERROR if spec.status_code >= 500 else logging.INFO
+    logger.log(level, "HTTP %s %s request_id=%s", spec.status_code, spec.code, request_id)
+    return _respond(spec, request_id)
+
+
 def register_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(AppError, app_error_handler)
     app.add_exception_handler(DatabaseUnavailableError, database_unavailable_handler)
     app.add_exception_handler(psycopg.Error, database_error_handler)
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)
