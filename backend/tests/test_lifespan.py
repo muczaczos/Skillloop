@@ -1,5 +1,6 @@
 import logging
 from typing import Annotated
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
@@ -73,4 +74,7 @@ def test_get_db_pool_without_a_pool_answers_503() -> None:
     response = TestClient(test_app).get("/needs-db")
 
     assert response.status_code == 503
-    assert response.json() == {"detail": main.DATABASE_UNAVAILABLE_DETAIL}
+    body = response.json()
+    assert set(body) == {"error"}
+    assert body["error"]["code"] == "SERVICE_UNAVAILABLE"
+    UUID(body["error"]["request_id"])

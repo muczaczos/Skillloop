@@ -1,4 +1,5 @@
 import logging
+from uuid import UUID
 
 import psycopg
 import pytest
@@ -8,7 +9,7 @@ from psycopg import errors as pg_errors
 from psycopg_pool import PoolClosed, PoolTimeout
 
 from app.db.errors import DatabaseUnavailableError, translate_db_errors
-from app.main import DATABASE_UNAVAILABLE_DETAIL, app
+from app.main import app
 
 
 def _raise(exc: BaseException) -> None:
@@ -67,7 +68,10 @@ def test_handler_returns_503_with_a_fixed_body_and_logs_no_secrets(
         response = TestClient(test_app).get("/db")
 
     assert response.status_code == 503
-    assert response.json() == {"detail": DATABASE_UNAVAILABLE_DETAIL}
+    body = response.json()
+    assert set(body) == {"error"}
+    assert body["error"]["code"] == "SERVICE_UNAVAILABLE"
+    UUID(body["error"]["request_id"])
     log_text = caplog.text
     assert "OperationalError" in log_text
     assert "secret-host" not in log_text

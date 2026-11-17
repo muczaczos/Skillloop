@@ -3,18 +3,15 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 from app.api import health
+from app.api.errors import register_error_handlers
 from app.core.config import settings
-from app.db.errors import DatabaseUnavailableError
 from app.db.pool import STARTUP_WAIT_SECONDS, create_pool, wait_until_ready
 
 API_PREFIX = "/api/v1"
-
-DATABASE_UNAVAILABLE_DETAIL = "The database is temporarily unavailable. Please try again later."
 
 logger = logging.getLogger(__name__)
 
@@ -47,24 +44,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="SkillLoop API", version="0.1.0", lifespan=lifespan)
 
+# Every error response of the API goes through these handlers (docs/API-DESIGN.md, section 13).
+register_error_handlers(app)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.exception_handler(DatabaseUnavailableError)
-async def database_unavailable_handler(
-    request: Request, exc: DatabaseUnavailableError
-) -> JSONResponse:
-    # str(exc) holds only the cause's class name / SQLSTATE: safe to log.
-    logger.error("%s", exc)
-    return JSONResponse(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        content={"detail": DATABASE_UNAVAILABLE_DETAIL},
-    )
 
 
 app.include_router(health.router, prefix=API_PREFIX)

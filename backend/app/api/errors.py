@@ -50,11 +50,14 @@ USER_FK_CONSTRAINT = "career_goals_user_id_fkey"
 
 # 22xxx data exceptions that user input can legitimately cause. Any other 22xxx code is
 # unexpected (a bug in our query or code) and answers 500.
+# Note: a NUL character is NOT reported as 22021. psycopg refuses it on the client side as a
+# DataError WITHOUT a SQLSTATE, which ends up as 500 below. That is unreachable in practice:
+# the request schemas reject NUL before any SQL runs.
 _CLIENT_DATA_SQLSTATES = frozenset(
     {
         "22001",  # string_data_right_truncation
         "22003",  # numeric_value_out_of_range
-        "22021",  # character_not_in_repertoire (e.g. a NUL character)
+        "22021",  # character_not_in_repertoire (invalid byte sequence for the encoding)
     }
 )
 
