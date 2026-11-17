@@ -4,7 +4,8 @@ Response body (docs/API-DESIGN.md, section 13):
 
     {"error": {"code": "...", "message": "...", "request_id": "<uuid>"}}
 
-`details` is only used for request validation errors and is not produced here.
+`details` is only used for request validation errors (422): a list of
+{"field": ..., "message": ...} and nothing else (see _validation_details).
 
 What is handled:
 - AppError (app/core/errors.py): business errors raised by services; status and code come
@@ -12,6 +13,9 @@ What is handled:
 - DatabaseUnavailableError: 503.
 - psycopg.Error: mapped by SQLSTATE (see _map_database_error). Anything not listed there is
   a bug or an unexpected failure: 500, never a client error.
+- RequestValidationError: 422 VALIDATION_ERROR. The messages come from a fixed table by error
+  type, not from Pydantic's `msg`: some of those texts repeat part of the submitted value
+  (e.g. an invalid UUID: "found `N` at 2"). `input`, `ctx` and `url` are never read.
 - HTTPException (FastAPI's and Starlette's: the authentication dependency, unknown paths,
   wrong methods): the status is kept; the code and the message come from a fixed table by
   status, never from the exception's `detail`, which could hold anything. Only a short list
@@ -29,11 +33,14 @@ It is in the body and in the log line, which is what links the two.
 """
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 from uuid import uuid4
 
 import psycopg
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -69,6 +76,75 @@ _CLIENT_DATA_SQLSTATES = frozenset(
         "22021",  # character_not_in_repertoire (invalid byte sequence for the encoding)
     }
 )
+
+
+# --- request validation (422) -------------------------------------------------------------
+
+# Where a field of the request lives; FastAPI puts it first in an error location.
+_LOCATIONS = ("body", "query", "path", "header", "cookie")
+# Upper bounds, so that a hostile request cannot make the answer huge.
+_MAX_VALIDATION_DETAILS = 20
+_MAX_FIELD_LENGTH = 100
+_MAX_MESSAGE_LENGTH = 200
+_VALUE_ERROR_PREFIX = "Value error, "
+GENERIC_FIELD_MESSAGE = "The value is invalid."
+
+# Message by Pydantic error type. Texts are fixed; none of them contains the value.
+_VALIDATION_MESSAGES: dict[str, str] = {
+    "missing": "This field is required.",
+    "extra_forbidden": "This field is not allowed.",
+    "string_too_short": "The value is too short.",
+    "string_too_long": "The value is too long.",
+    "too_short": "The value is too short.",  # what Annotated[str, Field(min_length=...)] reports
+    "too_long": "The value is too long.",
+    "string_type": "The value must be text.",
+    "int_parsing": "The value must be an integer.",
+    "int_type": "The value must be an integer.",
+    "int_from_float": "The value must be an integer.",
+    "float_parsing": "The value must be a number.",
+    "float_type": "The value must be a number.",
+    "bool_parsing": "The value must be true or false.",
+    "bool_type": "The value must be true or false.",
+    "uuid_parsing": "The value must be a valid UUID.",
+    "uuid_type": "The value must be a valid UUID.",
+    "literal_error": "The value is not one of the allowed options.",
+    "enum": "The value is not one of the allowed options.",
+    "greater_than": "The value is out of the allowed range.",
+    "greater_than_equal": "The value is out of the allowed range.",
+    "less_than": "The value is out of the allowed range.",
+    "less_than_equal": "The value is out of the allowed range.",
+    "json_invalid": "The request body is not valid JSON.",
+    "model_type": "The value has the wrong structure.",
+    "model_attributes_type": "The value has the wrong structure.",  # e.g. a body that is not an object
+    "dict_type": "The value has the wrong structure.",
+    "list_type": "The value has the wrong structure.",
+}
+
+
+def _validation_detail(error: Mapping[str, Any]) -> dict[str, str]:
+    """One {"field", "message"} entry. Reads only `loc`, `type` and, for value errors raised
+    by our own validators, `msg`. Never `input`, `ctx` or `url`."""
+    parts = [str(part) for part in error.get("loc", ())]
+    location = parts[0] if parts and parts[0] in _LOCATIONS else None
+    path = parts[1:] if location else parts
+    error_type = str(error.get("type", ""))
+    if error_type == "json_invalid":
+        path = []  # the location then holds a character offset of the body, not a field
+    # Errors that belong to no single field (a whole body) are named after their location.
+    field = (".".join(path) or location or "body")[:_MAX_FIELD_LENGTH]
+
+    if error_type == "value_error":
+        # Raised by validators of this code base (e.g. "must not be null"), whose messages are
+        # written not to contain the value. Pydantic prefixes them with "Value error, ".
+        message = str(error.get("msg", "")).removeprefix(_VALUE_ERROR_PREFIX)
+        message = message[:_MAX_MESSAGE_LENGTH] or GENERIC_FIELD_MESSAGE
+    else:
+        message = _VALIDATION_MESSAGES.get(error_type, GENERIC_FIELD_MESSAGE)
+    return {"field": field, "message": message}
+
+
+def _validation_details(exc: RequestValidationError) -> list[dict[str, str]]:
+    return [_validation_detail(error) for error in exc.errors()[:_MAX_VALIDATION_DETAILS]]
 
 
 # HTTPException statuses with their own code and message. Every other status below 500 is a
@@ -173,6 +249,25 @@ async def database_error_handler(request: Request, exc: Exception) -> JSONRespon
     return _respond(spec, request_id)
 
 
+async def validation_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    assert isinstance(exc, RequestValidationError)
+    request_id = str(uuid4())
+    details = _validation_details(exc)
+    # Only the number of problems is logged: field names can be chosen by the client.
+    logger.info("VALIDATION_ERROR: %d problem(s) request_id=%s", len(exc.errors()), request_id)
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": VALIDATION_ERROR_MESSAGE,
+                "details": details,
+                "request_id": request_id,
+            }
+        },
+    )
+
+
 async def http_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, StarletteHTTPException)
     request_id = str(uuid4())
@@ -188,3 +283,4 @@ def register_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(DatabaseUnavailableError, database_unavailable_handler)
     app.add_exception_handler(psycopg.Error, database_error_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+    app.add_exception_handler(RequestValidationError, validation_error_handler)

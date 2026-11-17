@@ -8,15 +8,18 @@ left. The real app has no route that fails on demand, so a small test app is giv
 
 import logging
 import time
-from typing import Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import psycopg
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from fastapi import HTTPException as FastAPIHTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 from psycopg import errors as pg_errors
+from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic_core import PydanticCustomError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import main
@@ -24,6 +27,8 @@ from app.api import errors as api_errors
 from app.api.deps import CurrentUser, get_token_verifier
 from app.core.errors import AppError, GoalNotFoundError
 from app.db.errors import DatabaseUnavailableError
+from app.schemas.career_goal import CareerGoalCreate, CareerGoalUpdate
+from app.schemas.profile import ProfileUpdate
 from tests.auth_helpers import (
     JWKSServer,
     SigningKey,
@@ -365,3 +370,307 @@ def test_unreachable_signing_keys_answer_503_in_d11_without_www_authenticate(
     error = _assert_d11(response, 503, "SERVICE_UNAVAILABLE")
     assert "www-authenticate" not in response.headers
     assert error["message"] == api_errors.SERVICE_UNAVAILABLE_MESSAGE
+
+
+# --- 6.4c: RequestValidationError -----------------------------------------------------------
+
+
+class _Line(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    qty: int
+
+
+class _Address(BaseModel):
+    zip: str
+
+
+class _Order(BaseModel):
+    lines: list[_Line]
+    address: _Address
+    kind: Literal["a", "b"] = "a"
+
+
+class _Weird(BaseModel):
+    """Validators whose own messages repeat the value: the handler must not pass them on."""
+
+    custom: str | None = None
+    asserted: str | None = None
+
+    @field_validator("custom")
+    @classmethod
+    def _custom(cls, value: str | None) -> str | None:
+        raise PydanticCustomError("weird_error", "leaks {value}", {"value": value})
+
+    @field_validator("asserted")
+    @classmethod
+    def _asserted(cls, value: str | None) -> str | None:
+        assert False, f"leaks {value}"
+
+
+def _validation_client() -> TestClient:
+    test_app = FastAPI()
+    test_app.exception_handlers.update(main.app.exception_handlers)
+
+    @test_app.post("/goals")
+    def create_goal(body: CareerGoalCreate) -> dict[str, bool]:
+        return {"ok": True}
+
+    @test_app.patch("/goals")
+    def update_goal(body: CareerGoalUpdate) -> dict[str, bool]:
+        return {"ok": True}
+
+    @test_app.patch("/profile")
+    def update_profile(body: ProfileUpdate) -> dict[str, bool]:
+        return {"ok": True}
+
+    @test_app.post("/orders")
+    def create_order(body: _Order) -> dict[str, bool]:
+        return {"ok": True}
+
+    @test_app.post("/weird")
+    def weird(body: _Weird) -> dict[str, bool]:
+        return {"ok": True}
+
+    @test_app.get("/query")
+    def query(limit: int, flag: bool = False) -> dict[str, bool]:
+        return {"ok": True}
+
+    @test_app.get("/items/{item_id}")
+    def item(item_id: UUID) -> dict[str, bool]:
+        return {"ok": True}
+
+    @test_app.get("/header")
+    def header(x_token: Annotated[str, Header()]) -> dict[str, bool]:
+        return {"ok": True}
+
+    return TestClient(test_app)
+
+
+@pytest.fixture(scope="module")
+def vclient() -> TestClient:
+    return _validation_client()
+
+
+CANARY = "CANARY-7f3a9"
+GOAL = {"target_role": "DevOps Engineer", "seniority": "junior"}
+
+
+def _details(response: Any) -> list[dict[str, str]]:
+    """Check the whole D11 validation envelope and return `details`."""
+    assert response.status_code == 422
+    body = response.json()
+    assert set(body) == {"error"}
+    error = body["error"]
+    assert set(error) == {"code", "message", "details", "request_id"}
+    assert error["code"] == "VALIDATION_ERROR"
+    assert error["message"] == api_errors.VALIDATION_ERROR_MESSAGE
+    UUID(error["request_id"])
+    assert isinstance(error["details"], list) and error["details"]
+    for entry in error["details"]:
+        assert set(entry) == {"field", "message"}, "details hold field and message only"
+    return error["details"]
+
+
+def _assert_no_internals(response: Any) -> None:
+    assert CANARY not in response.text
+    for forbidden in (
+        '"input"',
+        '"ctx"',
+        '"url"',
+        '"loc"',
+        '"msg"',
+        '"type"',
+        "errors.pydantic.dev",
+    ):
+        assert forbidden not in response.text
+
+
+def test_validation_handler_is_registered_on_the_application() -> None:
+    handler = main.app.exception_handlers[RequestValidationError]
+
+    assert handler is api_errors.validation_error_handler
+
+
+def test_an_unsupported_value_names_the_field_and_not_the_value(vclient: TestClient) -> None:
+    response = vclient.post("/goals", json={**GOAL, "seniority": CANARY})
+
+    assert _details(response) == [
+        {"field": "seniority", "message": "The value is not one of the allowed options."}
+    ]
+    _assert_no_internals(response)
+
+
+def test_missing_fields_are_reported_one_by_one(vclient: TestClient) -> None:
+    response = vclient.post("/goals", json={})
+
+    assert _details(response) == [
+        {"field": "target_role", "message": "This field is required."},
+        {"field": "seniority", "message": "This field is required."},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("payload", "field", "message"),
+    [
+        ({"target_role": "x" * 101}, "target_role", "The value is too long."),
+        ({"target_role": ""}, "target_role", "The value is too short."),
+        ({"target_role": "   "}, "target_role", "The value is too short."),
+        ({"description": "y" * 2001}, "description", "The value is too long."),
+        ({"target_role": 123}, "target_role", "The value must be text."),
+    ],
+)
+def test_limits_and_types_have_fixed_messages(
+    vclient: TestClient, payload: dict[str, Any], field: str, message: str
+) -> None:
+    response = vclient.post("/goals", json={**GOAL, **payload})
+
+    assert _details(response) == [{"field": field, "message": message}]
+
+
+def test_a_canary_in_every_submitted_value_never_comes_back(vclient: TestClient) -> None:
+    response = vclient.post(
+        "/goals",
+        json={
+            "target_role": CANARY * 30,  # too long
+            "seniority": CANARY,  # not allowed
+            "description": CANARY * 400,  # too long
+            "user_id": CANARY,  # forbidden field with a canary VALUE
+        },
+    )
+
+    fields = {entry["field"] for entry in _details(response)}
+    assert fields == {"target_role", "seniority", "description", "user_id"}
+    _assert_no_internals(response)
+
+
+@pytest.mark.parametrize("extra", ["user_id", "status", "id", "created_at"])
+def test_server_controlled_fields_are_reported_as_not_allowed(
+    vclient: TestClient, extra: str
+) -> None:
+    response = vclient.post("/goals", json={**GOAL, extra: CANARY})
+
+    assert _details(response) == [{"field": extra, "message": "This field is not allowed."}]
+    _assert_no_internals(response)
+
+
+def test_errors_raised_by_our_validators_keep_their_own_message(vclient: TestClient) -> None:
+    nul = vclient.post("/goals", json={**GOAL, "target_role": "a\u0000b"})
+    null = vclient.patch("/goals", json={"seniority": None})
+    profile = vclient.patch("/profile", json={"preferred_language": None})
+
+    assert _details(nul) == [{"field": "target_role", "message": "must not contain NUL characters"}]
+    assert _details(null) == [{"field": "seniority", "message": "must not be null"}]
+    assert _details(profile) == [{"field": "preferred_language", "message": "must not be null"}]
+
+
+def test_an_error_about_the_whole_body_is_named_body(vclient: TestClient) -> None:
+    response = vclient.patch("/goals", json={})
+
+    assert _details(response) == [
+        {"field": "body", "message": "at least one field must be provided"}
+    ]
+
+
+def test_a_body_of_the_wrong_shape_is_named_body(vclient: TestClient) -> None:
+    for body in ('"just a string"', "[1, 2]", "42"):
+        response = vclient.post(
+            "/goals", content=body, headers={"Content-Type": "application/json"}
+        )
+
+        assert _details(response) == [
+            {"field": "body", "message": "The value has the wrong structure."}
+        ]
+
+
+def test_malformed_json_is_reported_without_an_offset_or_the_text(vclient: TestClient) -> None:
+    response = vclient.post(
+        "/goals", content='{"target_role": ' + CANARY, headers={"Content-Type": "application/json"}
+    )
+
+    assert _details(response) == [
+        {"field": "body", "message": "The request body is not valid JSON."}
+    ]
+    _assert_no_internals(response)
+
+
+def test_nested_fields_use_dotted_paths_without_the_location_prefix(vclient: TestClient) -> None:
+    response = vclient.post(
+        "/orders",
+        json={"lines": [{"qty": 1}, {"qty": CANARY}, {"qty": 3, "extra": 1}], "address": {}},
+    )
+
+    assert _details(response) == [
+        {"field": "lines.1.qty", "message": "The value must be an integer."},
+        {"field": "lines.2.extra", "message": "This field is not allowed."},
+        {"field": "address.zip", "message": "This field is required."},
+    ]
+    _assert_no_internals(response)
+
+
+def test_query_path_and_header_parameters(vclient: TestClient) -> None:
+    query = vclient.get(f"/query?limit={CANARY}&flag={CANARY}")
+    missing = vclient.get("/query")
+    path = vclient.get(f"/items/{CANARY}")
+    header = vclient.get("/header")
+
+    assert _details(query) == [
+        {"field": "limit", "message": "The value must be an integer."},
+        {"field": "flag", "message": "The value must be true or false."},
+    ]
+    assert _details(missing) == [{"field": "limit", "message": "This field is required."}]
+    assert _details(path) == [{"field": "item_id", "message": "The value must be a valid UUID."}]
+    assert _details(header) == [{"field": "x-token", "message": "This field is required."}]
+    for response in (query, path):
+        _assert_no_internals(response)  # Pydantic's own UUID text would repeat a character
+
+
+def test_unknown_error_types_and_foreign_messages_fall_back_to_a_generic_text(
+    vclient: TestClient,
+) -> None:
+    response = vclient.post("/weird", json={"custom": CANARY, "asserted": CANARY})
+
+    assert _details(response) == [
+        {"field": "custom", "message": api_errors.GENERIC_FIELD_MESSAGE},
+        {"field": "asserted", "message": api_errors.GENERIC_FIELD_MESSAGE},
+    ]
+    _assert_no_internals(response)
+
+
+def test_the_number_of_details_is_capped(vclient: TestClient) -> None:
+    lines = [{"qty": CANARY} for _ in range(50)]
+
+    response = vclient.post("/orders", json={"lines": lines, "address": {"zip": "1"}})
+
+    assert len(_details(response)) == api_errors._MAX_VALIDATION_DETAILS
+
+
+def test_a_very_long_field_name_chosen_by_the_client_is_shortened(vclient: TestClient) -> None:
+    response = vclient.post("/goals", json={**GOAL, "k" * 500: 1})
+
+    (entry,) = _details(response)
+    assert entry["message"] == "This field is not allowed."
+    assert len(entry["field"]) == api_errors._MAX_FIELD_LENGTH
+
+
+def test_every_validation_error_has_its_own_request_id(vclient: TestClient) -> None:
+    ids = {vclient.post("/goals", json={}).json()["error"]["request_id"] for _ in range(5)}
+
+    assert len(ids) == 5
+
+
+def test_validation_errors_are_logged_by_count_only(
+    vclient: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger="app.api.errors"):
+        response = vclient.post("/goals", json={"seniority": CANARY, CANARY: CANARY})
+
+    ours = "\n".join(r.getMessage() for r in caplog.records if r.name == "app.api.errors")
+    request_id = response.json()["error"]["request_id"]
+    assert f"VALIDATION_ERROR: 3 problem(s) request_id={request_id}" in ours
+    assert CANARY not in ours
+
+
+def test_the_old_detail_shape_is_gone(vclient: TestClient) -> None:
+    body = vclient.post("/goals", json={}).json()
+
+    assert "detail" not in body and list(body) == ["error"]
