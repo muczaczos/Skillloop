@@ -19,7 +19,9 @@ What is handled:
 - HTTPException (FastAPI's and Starlette's: the authentication dependency, unknown paths,
   wrong methods): the status is kept; the code and the message come from a fixed table by
   status, never from the exception's `detail`, which could hold anything. Only a short list
-  of headers is passed on (see _FORWARDED_HEADERS).
+  of headers is passed on (see _FORWARDED_HEADERS). For a 405 the `Allow` header is rebuilt
+  from the real routing (see _allowed_methods), because Starlette names only the methods of
+  the first route that matches the path.
 
 The unique violation of one_active_goal_per_user is mapped to ActiveGoalExistsError by
 career_goal_service.create_goal(). It is deliberately NOT mapped again here: every 23505
@@ -34,7 +36,7 @@ It is in the body and in the log line, which is what links the two.
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from uuid import uuid4
 
@@ -43,6 +45,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import Match
 
 from app.core.errors import AppError
 from app.db.errors import DatabaseUnavailableError
@@ -162,6 +165,13 @@ _HTTP_STATUS_ERRORS: dict[int, tuple[str, str]] = {
 _FORWARDED_HEADERS = frozenset({"www-authenticate", "allow", "retry-after"})
 
 
+# The methods probed to build the Allow header of a 405. A method is listed only if a route really
+# serves it: API routes do not serve HEAD, but the Starlette documentation routes (/docs, /redoc,
+# /openapi.json) do. OPTIONS is not routed by this application, so it is never listed. Sorted on
+# purpose: the header is the same whatever order the routes were declared in.
+_PROBED_METHODS = ("DELETE", "GET", "HEAD", "PATCH", "POST", "PUT")
+
+
 @dataclass(frozen=True)
 class ErrorSpec:
     status_code: int
@@ -200,6 +210,44 @@ def _map_http_exception(exc: StarletteHTTPException) -> ErrorSpec:
     else:
         code, message = "CLIENT_ERROR", CLIENT_ERROR_MESSAGE
     return ErrorSpec(exc.status_code, code, message, headers or None)
+
+
+def _allowed_methods(request: Request) -> list[str]:
+    """The methods that the application really routes for the path of `request`, sorted.
+
+    Starlette answers 405 from the FIRST route that matches the path, and that route lists
+    only its own methods: with GET and PATCH on one path the header says "GET" or "PATCH"
+    depending on the declaration order (RFC 9110, 15.5.6 asks for all of them). So the
+    routing is asked instead, with the public Route.matches() contract only: a method is
+    allowed if some route matches the path AND that method completely.
+
+    Each probe uses a fresh, minimal scope; the scope of the real request is never touched.
+    """
+    allowed = []
+    for method in _PROBED_METHODS:
+        probe = {
+            "type": "http",
+            "method": method,
+            "path": request.scope["path"],
+            "root_path": request.scope.get("root_path", ""),
+            "headers": [],
+            "query_string": b"",
+            "app": request.app,
+        }
+        if any(route.matches(probe)[0] is Match.FULL for route in request.app.router.routes):
+            allowed.append(method)
+    return allowed
+
+
+def _with_complete_allow_header(spec: ErrorSpec, request: Request) -> ErrorSpec:
+    """Replace the Allow header of a 405 by the full list. If the routing knows no method for
+    this path, the header of the exception is left as it is (nothing is invented)."""
+    allowed = _allowed_methods(request)
+    if not allowed:
+        return spec
+    headers = {k: v for k, v in (spec.headers or {}).items() if k.lower() != "allow"}
+    headers["Allow"] = ", ".join(allowed)
+    return replace(spec, headers=headers)
 
 
 def _body(spec: ErrorSpec, request_id: str) -> dict[str, dict[str, str]]:
@@ -272,6 +320,8 @@ async def http_exception_handler(request: Request, exc: Exception) -> JSONRespon
     assert isinstance(exc, StarletteHTTPException)
     request_id = str(uuid4())
     spec = _map_http_exception(exc)
+    if exc.status_code == 405:
+        spec = _with_complete_allow_header(spec, request)
     # Neither `detail` nor the request path is logged: both can carry data.
     level = logging.ERROR if spec.status_code >= 500 else logging.INFO
     logger.log(level, "HTTP %s %s request_id=%s", spec.status_code, spec.code, request_id)
