@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import health
+from app.api import health, profile
 from app.api.errors import register_error_handlers
 from app.core.config import settings
 from app.db.pool import STARTUP_WAIT_SECONDS, create_pool, wait_until_ready
@@ -56,3 +56,4 @@ app.add_middleware(
 
 
 app.include_router(health.router, prefix=API_PREFIX)
+app.include_router(profile.router, prefix=API_PREFIX)
