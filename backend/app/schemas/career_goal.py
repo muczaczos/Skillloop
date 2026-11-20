@@ -22,7 +22,18 @@ from app.schemas.common import (
 class CareerGoalCreate(BaseModel):
     """POST /career-goals."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "target_role": "DevOps Engineer",
+                    "seniority": "junior",
+                    "description": "Prepare for a Junior DevOps Engineer position.",
+                }
+            ]
+        },
+    )
 
     target_role: TargetRole
     seniority: Seniority
@@ -33,7 +44,10 @@ class CareerGoalUpdate(BaseModel):
     """PATCH /career-goals/{id}. A field that is left out is not changed; an explicit null
     (or blank text) clears description and is an error for target_role and seniority."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"examples": [{"seniority": "mid", "description": None}]},
+    )
 
     target_role: TargetRole | None = None
     seniority: Seniority | None = None
@@ -57,7 +71,22 @@ class CareerGoalUpdate(BaseModel):
 class CareerGoalResponse(BaseModel):
     """A career goal as returned by the API (user_id is not repeated: it is the caller)."""
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
+            "examples": [
+                {
+                    "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+                    "target_role": "DevOps Engineer",
+                    "seniority": "junior",
+                    "description": "Prepare for a Junior DevOps Engineer position.",
+                    "status": "active",
+                    "created_at": "2026-11-12T10:00:00Z",
+                    "updated_at": "2026-11-12T10:00:00Z",
+                }
+            ]
+        },
+    )
 
     id: UUID
     target_role: str

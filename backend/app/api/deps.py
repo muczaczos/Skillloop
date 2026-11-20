@@ -22,7 +22,14 @@ logger = logging.getLogger(__name__)
 
 # auto_error=False: missing or non-Bearer credentials are handled below, so every
 # authentication failure returns the same 401 response.
-bearer_scheme = HTTPBearer(auto_error=False, description="Supabase access token")
+bearer_scheme = HTTPBearer(
+    auto_error=False,
+    bearerFormat="JWT",
+    description=(
+        "Supabase Auth access token (a JWT signed with ES256), sent as "
+        "`Authorization: Bearer <token>`. Obtain it from Supabase Auth; this API issues no tokens."
+    ),
+)
 
 UNAUTHORIZED_DETAIL = "Invalid or missing authentication token."
 AUTH_UNAVAILABLE_DETAIL = "Authentication is temporarily unavailable. Please try again later."

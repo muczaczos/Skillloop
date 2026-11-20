@@ -23,10 +23,21 @@ from fastapi import APIRouter, Depends, status
 from psycopg_pool import ConnectionPool
 
 from app.api.deps import CurrentUser, get_db_pool
+from app.api.openapi import VALIDATION_ERROR, conflict, not_found, protected_responses
+from app.core.errors import (
+    ActiveGoalExistsError,
+    GoalArchivedError,
+    GoalNotFoundError,
+    NoActiveGoalError,
+)
 from app.schemas.career_goal import CareerGoalCreate, CareerGoalResponse, CareerGoalUpdate
 from app.services import career_goal_service
 
-router = APIRouter(prefix="/career-goals", tags=["career-goals"])
+router = APIRouter(
+    prefix="/career-goals",
+    tags=["career-goals"],
+    responses=protected_responses(user_may_be_missing=True),
+)
 
 DbPool = Annotated[ConnectionPool, Depends(get_db_pool)]
 
@@ -36,6 +47,7 @@ DbPool = Annotated[ConnectionPool, Depends(get_db_pool)]
     response_model=CareerGoalResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Create the active career goal of the authenticated user",
+    responses={**conflict(ActiveGoalExistsError), **VALIDATION_ERROR},
 )
 def create_career_goal(
     data: CareerGoalCreate, user: CurrentUser, pool: DbPool
@@ -49,8 +61,11 @@ def create_career_goal(
     response_model=CareerGoalResponse,
     status_code=status.HTTP_200_OK,
     summary="Get the active career goal of the authenticated user",
+    responses=not_found(NoActiveGoalError),
 )
 def get_active_career_goal(user: CurrentUser, pool: DbPool) -> CareerGoalResponse:
+    """Returns the active goal of the user, or 404 NO_ACTIVE_GOAL if there is none (for
+    example after the goal was archived)."""
     return CareerGoalResponse.model_validate(career_goal_service.get_active_goal(pool, user))
 
 
@@ -59,6 +74,11 @@ def get_active_career_goal(user: CurrentUser, pool: DbPool) -> CareerGoalRespons
     response_model=CareerGoalResponse,
     status_code=status.HTTP_200_OK,
     summary="Update an active career goal of the authenticated user",
+    responses={
+        **not_found(GoalNotFoundError),
+        **conflict(GoalArchivedError),
+        **VALIDATION_ERROR,
+    },
 )
 def update_career_goal(
     goal_id: UUID, data: CareerGoalUpdate, user: CurrentUser, pool: DbPool
@@ -76,6 +96,11 @@ def update_career_goal(
     response_model=CareerGoalResponse,
     status_code=status.HTTP_200_OK,
     summary="Archive an active career goal of the authenticated user",
+    responses={
+        **not_found(GoalNotFoundError),
+        **conflict(GoalArchivedError),
+        **VALIDATION_ERROR,
+    },
 )
 def archive_career_goal(goal_id: UUID, user: CurrentUser, pool: DbPool) -> CareerGoalResponse:
     """Returns the archived goal. Archiving an archived goal is refused with 409."""

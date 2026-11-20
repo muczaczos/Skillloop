@@ -42,7 +42,39 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await asyncio.to_thread(pool.close)
 
 
-app = FastAPI(title="SkillLoop API", version="0.1.0", lifespan=lifespan)
+API_DESCRIPTION = """
+REST API of SkillLoop, a personal career knowledge coach.
+
+**Authentication.** Endpoints other than `/health` require a Supabase Auth access token:
+`Authorization: Bearer <token>`. The user is always taken from the verified token; no request
+field can name another user. A missing, invalid or expired token gives `401` with a
+`WWW-Authenticate: Bearer` header.
+
+**Errors.** Every error response, including those of unknown paths and wrong methods, has the
+same shape: `{"error": {"code", "message", "request_id"}}`. Request validation errors (`422`)
+add `details`, a list of `{"field", "message"}`. Branch on `code`, not on `message`.
+
+**Methods.** A path that exists but does not serve the requested method answers `405` with the
+unified error (`METHOD_NOT_ALLOWED`) and an `Allow` header listing every method the path serves.
+An unknown path answers `404` (`NOT_FOUND`).
+""".strip()
+
+OPENAPI_TAGS = [
+    {"name": "health", "description": "Liveness check of the application."},
+    {"name": "profile", "description": "The profile of the authenticated user."},
+    {
+        "name": "career-goals",
+        "description": "The professional goal of the user. A user has at most one active goal.",
+    },
+]
+
+app = FastAPI(
+    title="SkillLoop API",
+    version="0.1.0",
+    description=API_DESCRIPTION,
+    openapi_tags=OPENAPI_TAGS,
+    lifespan=lifespan,
+)
 
 # Every error response of the API goes through these handlers (docs/API-DESIGN.md, section 13).
 register_error_handlers(app)

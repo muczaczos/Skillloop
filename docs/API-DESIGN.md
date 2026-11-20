@@ -138,16 +138,19 @@ This is the proposed MVP endpoint set. Some endpoints may be combined or simplif
 
 Returns the authenticated user's profile.
 
-Response:
+Response `200`:
 
 ```
 {
   "id": "uuid",
   "display_name": "User",
   "preferred_language": "en",
-  "created_at": "2026-11-12T10:00:00Z"
+  "created_at": "2026-11-12T10:00:00Z",
+  "updated_at": "2026-11-12T10:00:00Z"
 }
 ```
+
+Errors: `401`, `404 PROFILE_NOT_FOUND`, `503`, `504`.
 
 ### PATCH `/profile`
 
@@ -162,15 +165,13 @@ Request:
 }
 ```
 
-Response:
+Fields that are left out are not changed; at least one field is required. `display_name` may be
+`null` to clear it; `preferred_language` (`en` or `pl`) may not be `null`. Unknown fields are
+rejected.
 
-```
-{
-  "id": "uuid",
-  "display_name": "New display name",
-  "preferred_language": "en"
-}
-```
+Response `200`: the full profile, as returned by `GET /profile`.
+
+Errors: `401`, `404 PROFILE_NOT_FOUND`, `422`, `503`, `504`.
 
 ## 6. Career Goal API
 
@@ -188,34 +189,58 @@ Request:
 }
 ```
 
-Response:
+`seniority` is `junior`, `mid` or `senior`. `description` is optional. `status` and `user_id`
+cannot be sent: a goal is always created active and always belongs to the caller.
+
+Response `201`:
 
 ```
 {
   "id": "uuid",
   "target_role": "DevOps Engineer",
   "seniority": "junior",
-  "status": "active"
+  "description": "Prepare for a Junior DevOps Engineer position.",
+  "status": "active",
+  "created_at": "2026-11-12T10:00:00Z",
+  "updated_at": "2026-11-12T10:00:00Z"
 }
 ```
 
-A user can have only one active career goal.
+A user can have only one active career goal: a second one is refused with `409
+ACTIVE_GOAL_EXISTS`.
+
+Errors: `401`, `409 ACTIVE_GOAL_EXISTS`, `422`, `503`, `504`.
 
 ### GET `/career-goals/active`
 
-Returns the current active goal and its basic information.
+Returns the current active goal (same body as above, with status `200`).
+
+Without an active goal (none was created, or it was archived) the answer is `404
+NO_ACTIVE_GOAL`.
+
+Errors: `401`, `404 NO_ACTIVE_GOAL`, `503`, `504`.
 
 ### PATCH `/career-goals/{id}`
 
-Updates an existing career goal.
+Updates an active career goal. Fields that are left out are not changed; `description` may be
+`null` to clear it; `target_role` and `seniority` may not be `null`; at least one field is
+required.
 
-The endpoint must verify that the goal belongs to the authenticated user.
+The goal must belong to the authenticated user. A goal of another user is indistinguishable from
+a missing one (`404 GOAL_NOT_FOUND`). An archived goal cannot be changed (`409 GOAL_ARCHIVED`).
+
+Response `200`: the updated goal.
+
+Errors: `401`, `404 GOAL_NOT_FOUND`, `409 GOAL_ARCHIVED`, `422`, `503`, `504`.
 
 ### POST `/career-goals/{id}/archive`
 
-Archives the active career goal.
+Archives the active career goal and returns it (`200`, status `archived`). An archived goal is
+immutable and never becomes active again.
 
 Historical sessions, assessments and competencies must remain available.
+
+Errors: `401`, `404 GOAL_NOT_FOUND`, `409 GOAL_ARCHIVED`, `422` (invalid id), `503`, `504`.
 
 ## 7. Competency API
 
@@ -621,6 +646,10 @@ Audio is not permanently stored by default.
 
 All API errors must use a consistent response structure.
 
+This is decision D11. Every error response has exactly this shape, including those of unknown
+paths (`404`) and wrong methods (`405`). The body is `{"error": {"code", "message",
+"request_id"}}`; only request validation errors (`422`) add `details`.
+
 Example:
 
 ```
@@ -631,13 +660,36 @@ Example:
     "details": [
       {
         "field": "seniority",
-        "message": "Unsupported seniority level."
+        "message": "The value is not one of the allowed options."
       }
     ],
     "request_id": "uuid"
   }
 }
 ```
+
+Messages are fixed texts. They never repeat submitted values and never contain internals.
+Clients should branch on `code`, not on `message`. `request_id` is generated per error response
+and appears in the server log.
+
+Error codes in use:
+
+|Status|Code|When|
+|---|---|---|
+|401|`UNAUTHORIZED`|Missing, invalid or expired token, or the token's user no longer exists. Sent with `WWW-Authenticate: Bearer`.|
+|403|`FORBIDDEN`|Reserved for HTTP 403 raised by the framework.|
+|404|`NOT_FOUND`|Unknown path.|
+|404|`PROFILE_NOT_FOUND`|The profile does not exist.|
+|404|`GOAL_NOT_FOUND`|The goal does not exist or belongs to another user.|
+|404|`NO_ACTIVE_GOAL`|The user has no active goal.|
+|405|`METHOD_NOT_ALLOWED`|The path does not serve the method. `Allow` lists every method it serves.|
+|409|`ACTIVE_GOAL_EXISTS`|The user already has an active goal.|
+|409|`GOAL_ARCHIVED`|The goal is archived and can no longer be changed.|
+|409|`CONFLICT`|Another conflict with the current state of a resource.|
+|422|`VALIDATION_ERROR`|Invalid request; `details` lists the problems.|
+|503|`SERVICE_UNAVAILABLE`|The database or the keys used to verify tokens are temporarily unavailable.|
+|504|`DATABASE_TIMEOUT`|The database exceeded its statement timeout. Possible on every endpoint that uses the database.|
+|500|`INTERNAL_ERROR`|An unexpected database failure. The response for other unhandled exceptions is not yet specified.|
 
 Recommended HTTP status codes:
 
@@ -700,6 +752,15 @@ http://localhost:8000/redoc
 All endpoint request and response models should be defined using Pydantic.
 
 The OpenAPI specification should remain synchronized with the actual implementation.
+
+The specification documents, for every endpoint: the success response, the error responses it
+can really return (using the unified error models of section 13, including `422` instead of
+FastAPI's default validation error), the `HTTPBearer` security scheme (Supabase access token,
+JWT) and the `WWW-Authenticate` header of `401`. `405` and its `Allow` header are described in
+the general description of the API, because they come from routing, not from an operation.
+
+`backend/tests/test_openapi_contract.py` guards this: it checks the document statically and
+checks that real responses validate against the documented models. It needs no database.
 
 ## 16. Out of Scope for MVP
 

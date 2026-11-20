@@ -15,10 +15,12 @@ from fastapi import APIRouter, Depends, status
 from psycopg_pool import ConnectionPool
 
 from app.api.deps import CurrentUser, get_db_pool
+from app.api.openapi import VALIDATION_ERROR, not_found, protected_responses
+from app.core.errors import ProfileNotFoundError
 from app.schemas.profile import ProfileResponse, ProfileUpdate
 from app.services import profile_service
 
-router = APIRouter(prefix="/profile", tags=["profile"])
+router = APIRouter(prefix="/profile", tags=["profile"], responses=protected_responses())
 
 DbPool = Annotated[ConnectionPool, Depends(get_db_pool)]
 
@@ -28,8 +30,11 @@ DbPool = Annotated[ConnectionPool, Depends(get_db_pool)]
     response_model=ProfileResponse,
     status_code=status.HTTP_200_OK,
     summary="Get the profile of the authenticated user",
+    responses=not_found(ProfileNotFoundError),
 )
 def get_profile(user: CurrentUser, pool: DbPool) -> ProfileResponse:
+    """Returns the profile of the user identified by the access token. The profile is created
+    automatically when the user registers."""
     return ProfileResponse.model_validate(profile_service.get_profile(pool, user))
 
 
@@ -38,6 +43,7 @@ def get_profile(user: CurrentUser, pool: DbPool) -> ProfileResponse:
     response_model=ProfileResponse,
     status_code=status.HTTP_200_OK,
     summary="Update the profile of the authenticated user",
+    responses={**not_found(ProfileNotFoundError), **VALIDATION_ERROR},
 )
 def update_profile(data: ProfileUpdate, user: CurrentUser, pool: DbPool) -> ProfileResponse:
     """Fields that are left out are not changed. `display_name` may be set to null to clear

@@ -14,7 +14,10 @@ class ProfileUpdate(BaseModel):
     display_name and is an error for preferred_language. Unknown fields (id, user_id, ...)
     are rejected, never ignored."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"examples": [{"display_name": "Ann", "preferred_language": "pl"}]},
+    )
 
     display_name: DisplayName | None = None
     preferred_language: Language | None = None
@@ -35,7 +38,20 @@ class ProfileUpdate(BaseModel):
 class ProfileResponse(BaseModel):
     """A profile as returned by the API (user_id is not repeated: it is the caller)."""
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
+            "examples": [
+                {
+                    "id": "11111111-1111-1111-1111-111111111111",
+                    "display_name": "Ann",
+                    "preferred_language": "pl",
+                    "created_at": "2026-11-12T10:00:00Z",
+                    "updated_at": "2026-11-12T10:00:00Z",
+                }
+            ]
+        },
+    )
 
     id: UUID
     display_name: str | None
