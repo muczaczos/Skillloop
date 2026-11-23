@@ -1,6 +1,6 @@
  ### **SkillLoop – MVP Scope**
 
-**Version:** 1.0  
+**Version:** 1.1  
 **Status:** Draft  
 **Product:** SkillLoop – Personal Career Knowledge Coach  
 **Platform:** Responsive Web Application / PWA
@@ -76,16 +76,16 @@ Each competency contains:
     
 - Explanation of why it is required.
     
-- Expected knowledge and skills.
+- Expected knowledge and skills (covered by the description and the rationale; there is no separate field).
     
 
-Competencies are classified into:
+Competencies are classified by `knowledge_type` into:
 
-1. Knowledge required from memory.
+1. Knowledge required from memory (`memory`).
     
-2. Skills that must be demonstrated in practice.
+2. Knowledge that must be applied in practice (`application`). In the MVP it is assessed only through explanations, so it does not prove practical proficiency.
     
-3. Information that can be retrieved from documentation.
+3. Information that can be retrieved from documentation (`documentation`).
     
 
 The user can:
@@ -96,8 +96,17 @@ The user can:
     
 - Add missing competencies.
     
-- Remove irrelevant competencies.
+- Archive irrelevant competencies. An archived competency is kept for history and cannot be restored.
     
+
+Rules of the competency map (approved in Stage 9.0):
+
+- The map belongs to the user's career goal. Competencies are not shared between goals or users, and there is no global catalogue.
+- A competency has a flat text category; there is no hierarchy.
+- A goal can have at most 50 active competencies. The name of an active competency is unique within the goal (ignoring case).
+- Archiving a competency is one-way. When a goal is archived, its map is frozen: it stays readable and cannot be changed.
+- The map stores the **expected** level only. The user's current level is calculated from assessments and is not part of the map.
+- Delivery order: the map is first created and edited manually (Stage 9); AI generation of the map follows in a later stage. The acceptance criteria in section 7 are unchanged: the MVP is complete only when AI can generate the map.
 
 ### 3.3 Initial Competency Assessment
 

@@ -1,13 +1,13 @@
 
 
 **Project:** SkillLoop  
-**Version:** 1.2
+**Version:** 1.3
 
-**Status:** Draft. `profiles`, `career_goals` and the `skillloop_api` role are implemented; all other entities are planned.
+**Status:** Draft. `profiles`, `career_goals` and the `skillloop_api` role are implemented; all other entities are planned. The design of `competencies` (sections 3, 4.3, 4.3.1, 4.8 and 6.2.1) was approved in Stage 9.0 and stays **Planned** until the Stage 9.1 migration exists and its tests have passed.
 
 **Database:** Supabase PostgreSQL
 
-**Verified against:** the migrations in `supabase/migrations/` (`20261115160519_create_api_role`, `20261115172015_create_profiles`, `20261115173804_create_career_goals`) and the pgTAP tests in `supabase/tests/database/`, on 2026-11-20. The files were read and compared with this document; the pgTAP suite was not executed for this update, and the state of any remote Supabase project was not checked.
+**Verified against:** the migrations in `supabase/migrations/` (`20261115160519_create_api_role`, `20261115172015_create_profiles`, `20261115173804_create_career_goals`) and the pgTAP tests in `supabase/tests/database/`, on 2026-11-20. The files were read and compared with this document; the pgTAP suite was not executed for this update, and the state of any remote Supabase project was not checked. Stage 9.0 (2026-11-23) changed only the planned sections about `competencies`: no migration was added and nothing was re-verified against a database.
 
 ---
 
@@ -67,7 +67,7 @@ The MVP uses the following main entities:
 |---|---|---|
 |profiles|Additional user information|Implemented|
 |career_goals|User's professional development goal|Implemented|
-|competencies|Competency map belonging to a goal|Planned|
+|competencies|Competencies of a career goal (flat list; manual CRUD in Stage 9)|Planned|
 |learning_sessions|Diagnostic or learning sessions|Planned|
 |session_items|Questions, user responses and AI evaluations|Planned|
 |recommendations|AI-generated learning recommendations|Planned|
@@ -78,7 +78,7 @@ The MVP uses the following main entities:
     
 - One user can have one active career goal.
     
-- One career goal contains many competencies.
+- One career goal contains many competencies (at most 50 active ones). A competency belongs to exactly one goal and to the owner of that goal; archiving the goal freezes its competencies.
     
 - One career goal can have many learning sessions.
     
@@ -160,70 +160,99 @@ Stores the user's professional development goal. Migration: `20261115173804_crea
 
 **Deletion:** deleting a user from `auth.users` deletes all of the user's goals, archived ones included (`ON DELETE CASCADE`). As with `profiles`, this is the current implementation and **not an approved data deletion policy**. See section 8.
 
+**Planned change (Stage 9.1a):** the migration of `competencies` adds `UNIQUE (id, user_id)` to this table (constraint `career_goals_id_user_id_key`), as the target of the composite foreign key of `competencies`. No column, grant or policy of `career_goals` changes. Rule D13 is extended to the competencies of an archived goal (section 4.3).
+
 **Tests:** `supabase/tests/database/10_profiles.test.sql` and `20_career_goals.test.sql` check the structure, constraints, triggers, privileges, Row Level Security, immutability of archived goals and the cascade.
 
 ### 4.3 competencies — Planned
 
-Stores the competency map generated for a career goal.
+Stores the competencies of one career goal: what a person in the goal's target role and seniority is expected to know.
 
-|Column|Type|Description|
+**Status: Planned.** The design below was approved in Stage 9.0. No migration exists yet. This section changes to Implemented only after the Stage 9.1 migration exists and its pgTAP and integration tests have passed (see section 10 and `IMPLEMENTATION-PLAN.md`).
+
+**Ownership model.** A competency belongs to exactly one career goal. There is no global competency catalogue, and a competency is never shared between goals or between users. The same name (for example "Docker") appears as separate rows in separate goals. The expected level and the importance describe what the goal requires, so they live in the same row as the competency.
+
+|Column|Type|Constraints and defaults|
 |---|---|---|
-|id|UUID|Primary key|
-|career_goal_id|UUID|Parent career goal|
-|name|TEXT|Competency name|
-|description|TEXT|Competency description|
-|rationale|TEXT|Why this competency matters for the selected role|
-|knowledge_type|TEXT|memory, application or documentation|
-|importance|TEXT|critical, high, medium or low|
-|expected_level|TEXT|Expected proficiency: beginner, intermediate or advanced|
-|current_level|TEXT|Current assessed proficiency|
-|display_order|INTEGER|Position in the competency list|
-|status|TEXT|active or archived|
-|source|TEXT|ai_generated or user_added|
-|created_at|TIMESTAMPTZ|Creation timestamp|
-|updated_at|TIMESTAMPTZ|Last update timestamp|
+|id|uuid|Primary key; `DEFAULT gen_random_uuid()`|
+|career_goal_id|uuid|`NOT NULL`; first column of the composite foreign key (below)|
+|user_id|uuid|`NOT NULL`; owner; second column of the composite foreign key. Stored on the row so that Row Level Security does not need a join|
+|name|text|`NOT NULL`; CHECK: 1–100 characters after trimming whitespace|
+|description|text|Nullable; CHECK: NULL or at most 1000 characters|
+|rationale|text|Nullable; CHECK: NULL or at most 1000 characters. Why the competency matters for the role|
+|category|text|Nullable; CHECK: NULL or 1–60 characters after trimming. A flat grouping label, not a hierarchy|
+|knowledge_type|text|`NOT NULL`; CHECK: `memory`, `application` or `documentation`|
+|importance|text|`NOT NULL`; CHECK: `critical`, `high`, `medium` or `low`|
+|expected_level|text|`NOT NULL`; CHECK: `beginner`, `intermediate` or `advanced` (`not_assessed` is not allowed)|
+|display_order|integer|`NOT NULL DEFAULT 0`; CHECK: `>= 0`. A plain sortable value; there is no reorder endpoint in Stage 9|
+|status|text|`NOT NULL DEFAULT 'active'`; CHECK: `active` or `archived`|
+|created_at|timestamptz|`NOT NULL DEFAULT now()`|
+|updated_at|timestamptz|`NOT NULL DEFAULT now()`; set by the trigger `competencies_set_updated_at` (the existing `public.set_updated_at()`) on every UPDATE|
 
-**Knowledge types:**
+**Planned keys, constraints and indexes:**
 
-- `memory` — knowledge the user should understand and recall without documentation.
-    
-- `application` — knowledge the user should be able to apply in practice.
-    
-- `documentation` — knowledge the user should know how to find and use in documentation.
-    
+|Object|Definition|Purpose|
+|---|---|---|
+|`career_goals_id_user_id_key`|`UNIQUE (id, user_id)` added to `career_goals` by the same migration|Target of the composite foreign key. Redundant with the primary key, but PostgreSQL requires a unique constraint on the referenced columns|
+|`competencies_goal_owner_fkey`|`FOREIGN KEY (career_goal_id, user_id) REFERENCES career_goals (id, user_id) ON DELETE CASCADE`|The database guarantees that `user_id` is the owner of the parent goal. A client cannot attach a competency to another user's goal, even if a policy were wrong|
+|`competencies_active_name_unique`|unique index on `(career_goal_id, lower(btrim(name)))` where `status = 'active'`|At most one active competency with a given name per goal, ignoring case and surrounding whitespace. Archived competencies release their name|
+|`competencies_goal_status_order_idx`|on `(career_goal_id, status, display_order)`|Listing and counting the competencies of a goal|
+|CHECK constraints|`competencies_name_check`, `competencies_description_check`, `competencies_rationale_check`, `competencies_category_check`, `competencies_knowledge_type_check`, `competencies_importance_check`, `competencies_expected_level_check`, `competencies_display_order_check`, `competencies_status_check`|As in the column table|
+|Triggers|`competencies_lock_goal` (statement level), `competencies_enforce_goal_rules` (row level), `competencies_set_updated_at`|Limit, freezing and synchronisation: see section 4.8|
 
-**Proficiency levels:**
+There is no separate foreign key from `user_id` to `auth.users`: the composite key already guarantees that the user exists, and deleting a user reaches the competencies through `auth.users` → `career_goals` → `competencies` (see section 8). `lower()` depends on the database collation and is not a full Unicode case folding; for names of technologies this is accepted.
+
+**Deliberately not stored (approved in Stage 9.0):**
+
+- `current_level`: the user's current proficiency is calculated from assessment history (section 5). Storing it in this table would create a second source of truth. It will be derived when the assessment tables exist.
+- `source` (`ai_generated` or `user_added`): in Stage 9 every competency is added manually. The column will be added together with AI generation.
+- `expectations` (a separate "expected knowledge and skills" field): `description` and `rationale` cover it. A separate field needs a concrete demonstrated need.
+- A hierarchy (`parent_id`, a categories table): `category` is plain text.
+- A global catalogue or a copy-from-template mechanism.
+
+**Knowledge types.** `knowledge_type` describes **what the role requires of the person**. It is not a statement about what the user has demonstrated.
+
+|Value|Meaning|What it does not mean|
+|---|---|---|
+|`memory`|Knowledge the person in this role should be able to recall without looking anything up: concepts, terminology, mental models (for example what a container is, or the classes of HTTP status codes). Assessed through recall and explanation questions.|It does not require knowledge of exact syntax or option names.|
+|`application`|Knowledge the role requires the person to apply at work: to know how and when to use a tool or technique (for example to choose a deployment strategy or to write a Dockerfile). In the MVP it is assessed only through text or voice explanations, so an assessment can show that the user is able to explain how they would apply it.|It does **not** mean demonstrated practical proficiency. The system must not claim practical competence from a theoretical explanation (`AI-ASSESSMENT-DESIGN.md`). Exercises and code execution are deferred features.|
+|`documentation`|Knowledge the person does not have to memorise, but must know exists, where to find, and how to read and interpret in official documentation (for example the flags of a command or the arguments of a provider). Assessed through orientation and interpretation, not recall of details.|It does not mean the details can be ignored: the person must be able to find them.|
+
+**Expected level.** `expected_level` is the proficiency the goal requires for this competency, for the goal's role and seniority.
 
 |Level|Meaning|
 |---|---|
-|not_assessed|Insufficient assessment data to determine the user's proficiency|
-|beginner|Basic concepts are partially understood|
-|intermediate|The user understands the topic and can explain it|
-|advanced|The user demonstrates deep and consistent understanding|
+|beginner|Basic concepts are understood and can be used with guidance|
+|intermediate|The person understands the topic and can explain it and apply it in typical situations|
+|advanced|The person demonstrates deep and consistent understanding, including less common cases|
 
-**Important distinction:**
-
-- `expected_level` describes the proficiency required for the selected role and seniority.
-    
-- `current_level` describes the user's currently assessed proficiency.
-    
-- `not_assessed` is a valid state for `current_level`, but not for `expected_level`.
-    
+`not_assessed` is a valid value of the user's **current** proficiency (section 5) and is not valid for `expected_level`. The current level is not stored in this table.
 
 **Business rules:**
 
-- Users can edit, add and archive competencies.
-    
-- Archiving a competency must not delete its historical assessments.
-    
-- Each competency belongs to exactly one career goal.
-    
-- Expected proficiency is not the same as the user's current proficiency.
-    
-- Current proficiency is calculated from assessment history, not manually entered by the user.
-    
-- New assessments can update current proficiency over time.
-    
+- A user can add, edit and archive competencies of their active goal. Nobody deletes a competency through the application.
+- **Archiving a competency is one-way.** An archived competency is immutable and never becomes active again. It stays stored and stays visible to its owner.
+- **An archived goal freezes its competencies** (the same principle as rule D13 for goals): they stay readable, but they cannot be edited or archived and no competency can be added. The status values of the competencies are not rewritten when a goal is archived.
+- **At most 50 active competencies per goal.** Archived competencies do not count; archiving one frees a slot. The number of archived competencies is not limited in the MVP (accepted).
+- **The name of an active competency is unique within its goal**, ignoring case and surrounding whitespace.
+- A competency cannot be moved to another goal or user.
+- Archiving a competency must not delete its historical assessments. Foreign keys from future tables to `competencies` are decided together with the deletion policy (section 8.3, decision 1).
+- Expected proficiency is not the same as current proficiency; the second is calculated from assessment history, not entered by the user.
+
+#### 4.3.1 Write behaviour in special situations — Planned
+
+These cases apply to every client that writes through the role `authenticated`: the backend and, because the schema is exposed (section 6.3), the Data API. They are tested in Stage 9.1 (`IMPLEMENTATION-PLAN.md`). SQLSTATE `23514` is a `check_violation`; the constraint name is in the error and is what the backend reads.
+
+|Situation|Result in the database|Result in the API (Stages 9.2–9.3)|
+|---|---|---|
+|**The user has no active goal.** INSERT of a competency|The statement trigger finds no goal to lock and does nothing; the row trigger finds no active goal and refuses with `23514`, constraint `competencies_goal_not_active`. Nothing is written.|The service reads the goal: the user's own archived goal → `409 GOAL_ARCHIVED`; no such goal → `404 GOAL_NOT_FOUND`|
+|**The user has no active goal.** UPDATE or archive of a competency|Zero rows: the UPDATE policy requires an active goal. No error is raised.|The service reads the competency and, if needed, its goal, in this order: not visible → `404 COMPETENCY_NOT_FOUND`; visible and itself archived → `409 COMPETENCY_ARCHIVED`; otherwise the goal is archived → `409 GOAL_ARCHIVED` (section 4.8)|
+|**The target goal is archived** (the user may have another, active goal)|INSERT: `23514` `competencies_goal_not_active`, as above. UPDATE: zero rows. The statement trigger locks the user's active goal, which is harmless.|As in the two rows above|
+|**The target goal belongs to another user**|Indistinguishable from a missing goal: the lock query cannot see it. INSERT: `23514` `competencies_goal_not_active`. UPDATE of another user's competency: zero rows. The Row Level Security `WITH CHECK` is a second barrier (`42501`) if the trigger were absent.|`404 GOAL_NOT_FOUND` or `404 COMPETENCY_NOT_FOUND`; never a hint that the resource exists|
+|**One INSERT of several competencies** (not exposed by the MVP API, possible through the Data API)|The statement lock is taken once. The row trigger counts the active competencies **including the rows that the same statement already inserted**. The first row that would be the 51st active competency raises `23514` `competencies_active_limit`, and **the whole statement is rolled back: no row is inserted**. Exactly 50 active rows pass. A duplicate name inside the statement raises `23505` and also rolls back the whole statement.|The MVP API adds one competency per request; the limit is reported as `409 COMPETENCY_LIMIT_REACHED`|
+|**One UPDATE of several competencies** (not exposed by the MVP API, possible through the Data API)|The statement lock is taken before any row is read or locked. Rows are processed in an unspecified order and the statement is atomic: if one row fails (for example `23505`), no row is changed. Rows that Row Level Security hides (another user's, archived, or in an archived goal) are silently left out. The unique index is not deferrable, so swapping two names in a single statement fails with `23505` even if the final state would be valid. Archiving several rows is allowed and frees slots.|The MVP API changes one competency per request|
+|**A goal is archived while a competency statement is waiting for the lock**|After the lock is granted the row trigger checks the status again and refuses with `23514` `competencies_goal_not_active`. This also covers UPDATE, which would otherwise have been silently filtered.|`409 GOAL_ARCHIVED`|
+|**A privileged role** (`postgres`, `service_role`) writes to `competencies`|No statement lock (no `auth.uid()`). The row trigger still enforces status and limit, but deadlock freedom now depends on the writer: the role **must lock the goal first**. This is a mandatory contract of the architecture (section 4.8, rule L2).|Not used by the backend|
 
 ### 4.4 learning_sessions — Planned
 
@@ -360,6 +389,81 @@ PostgreSQL grants `EXECUTE` on new functions to `PUBLIC` by default, and that ca
 
 `set_updated_at()` is written to be reused by the triggers of future tables. Those triggers are **Planned**.
 
+### 4.8 Synchronisation of competency writes (design V3) — Planned
+
+**Status: Planned.** Approved in Stage 9.0, not implemented. Nothing in this section is verified against a running database yet; the facts about PostgreSQL come from its documentation and source (REL_17_STABLE; the local Supabase stack uses PostgreSQL 17), and the assumptions that still need a test are listed at the end.
+
+**The problem.** Two rules about one goal must hold under concurrent requests: at most 50 active competencies, and the competencies of an archived goal are frozen. Neither can be a CHECK constraint (each needs other rows or the state of the parent). Counting before inserting is a check-then-insert race under READ COMMITTED, the default level, which the backend does not change: two requests can both count 49 and both insert. Further, a competency insert that starts just before the goal is archived must not slip into the frozen goal.
+
+**The mechanism.** Every write to `competencies` first takes a row lock on the **goal row** (`FOR NO KEY UPDATE`), and keeps it until the end of the transaction. The lock acts as a mutex per goal.
+
+|Object|Fires|Behaviour|
+|---|---|---|
+|`competencies_lock_goal`, function `competencies_lock_active_goal()`|`BEFORE INSERT OR UPDATE`, `FOR EACH STATEMENT`|Locks the caller's active goal: `SELECT 1 FROM career_goals WHERE user_id = (select auth.uid()) AND status = 'active' FOR NO KEY UPDATE`. There is at most one such row (`one_active_goal_per_user`). If there is none, it does nothing and raises nothing. It runs before any row of the statement is read or locked, and also when the statement changes zero rows.|
+|`competencies_enforce_goal_rules`, function `competencies_enforce_goal_rules()`|`BEFORE INSERT OR UPDATE`, `FOR EACH ROW`|INSERT: locks the target goal `FOR NO KEY UPDATE` (taking a lock the transaction already holds is a no-op). If no row is found or its status is not `active`, it raises `23514` with the constraint name `competencies_goal_not_active`. If the new row is active and the goal already has 50 or more active competencies, it raises `23514` with `competencies_active_limit`. UPDATE: the same lock and the same goal check, without the count (an UPDATE cannot make an archived competency active).|
+
+Both functions are `SECURITY INVOKER` (they run as `authenticated`), explicitly `VOLATILE` (required: only a volatile function gets a fresh snapshot for each query it runs, and only a volatile `BEFORE ROW` trigger sees rows inserted earlier by the same statement), have `search_path` set to empty, and have `EXECUTE` revoked from `public`, `anon` and `authenticated`. **No `SECURITY DEFINER` is used and no existing grant is widened.** The row limit of 50 is a constant in the function; changing it needs a new migration.
+
+**Why `authenticated` is allowed to take the lock.** PostgreSQL requires `UPDATE` privilege on at least one column, in addition to `SELECT`, for `SELECT … FOR NO KEY UPDATE` (documentation of `SELECT`; the executor accepts a privilege on any one column when no column is named). `authenticated` already has column-level `UPDATE` on `career_goals (target_role, seniority, description, status)` and table-wide `SELECT` (section 6.2). The `USING` expressions of the `UPDATE` policies are applied to such a lock query as well, so `career_goals_update_own` (own and active) filters it: an archived goal and another user's goal are **invisible** to the lock and return no row. The trigger therefore cannot tell "archived" from "does not exist"; both are refused, and the backend tells them apart afterwards by reading the goal (the `SELECT` policy shows the owner their own archived goals). A pgTAP test asserts that the grants of `career_goals` stay unchanged.
+
+**Lock modes (PostgreSQL documentation).**
+
+|Requested mode|Conflicts with|
+|---|---|
+|`FOR KEY SHARE`|`FOR UPDATE`|
+|`FOR SHARE`|`FOR NO KEY UPDATE`, `FOR UPDATE`|
+|`FOR NO KEY UPDATE`|`FOR SHARE`, `FOR NO KEY UPDATE`, `FOR UPDATE`|
+|`FOR UPDATE`|all of them|
+
+A plain `UPDATE` of a goal that does not change a key column takes `FOR NO KEY UPDATE`; so do archiving and editing a goal. The foreign-key check of the composite key takes `FOR KEY SHARE` on the goal, which does not conflict. Row locks are held until the transaction ends and never block plain reads.
+
+**How the rules hold.**
+
+- **Limit of 50.** All writers to one goal queue on the goal lock. The count runs as a separate query after the lock is granted, so it sees every row committed by the previous holder. The number of active competencies grows only through INSERT (nothing can reactivate a competency), and INSERTs are serialised, so 50 cannot be exceeded. In one multi-row INSERT the statement lock is taken once and the row trigger sees the earlier rows of the same statement.
+- **Freezing.** Archiving or editing a goal needs the same row lock, so it is serialised with every competency write of that goal. A statement that waited for the lock checks the status again after it is granted (a locking read in READ COMMITTED returns the latest version of the row, and the row is skipped if it no longer matches). A write that got the lock first commits before the archiving proceeds; a write that comes later is refused.
+- A statement that waited for the lock still uses the snapshot it took at its start for its own scan and for the `WITH CHECK` of the policies. The row trigger is therefore the authoritative check; the policies stay as a second barrier.
+
+**Why this is free of lock cycles.** All locks on competencies of one goal are taken in the order *goal row first, then competency rows*, and the first lock is exclusive among writers. The writer that holds the goal lock never waits for something held by a writer that waits for the goal lock, because the waiting writers have not locked or changed any competency yet. Unique-index checks only wait for a transaction that has really changed a row (a lock-only tuple lock does not make a unique check wait), and only the goal-lock holder changes rows. The cycles that this design removes are reproduced by tests of `IMPLEMENTATION-PLAN.md`: two edits swapping names under a shared lock (T2), and the order goal → competencies used by deletion (T5a, an explicit deletion that follows rule L2, and T5b, the real `ON DELETE CASCADE`). T4 covers a multi-row UPDATE against a single-row edit. Which of two waiting transactions PostgreSQL wakes first is not guaranteed, so T4 does not depend on it and asserts only outcomes that hold in every order.
+
+**Invariants (approved):**
+
+- **L1. Lock order: the goal row first, then competency rows. Never the reverse.** For `authenticated` the statement trigger enforces it. No transaction may lock or change a competency before locking the goal row.
+- **L2. Mandatory architecture contract for privileged writes.** A privileged role (`postgres`, `service_role`) has no `auth.uid()`, so the statement trigger does nothing for it. **Every write to `competencies` made by `postgres` or `service_role`, now or in the future, must first lock the career goal in the same transaction**: `SELECT 1 FROM public.career_goals WHERE id = <goal id> FOR NO KEY UPDATE`, before the first statement that touches `competencies`. The rule covers INSERT, UPDATE and DELETE and every kind of writer: data migrations, backfills, seed and repair scripts, administrative tools and future background jobs. A write that spans several goals locks all of them first, in ascending `id` order. Reading is not restricted.
+  - This is a **mandatory contract of the architecture**, not a recommendation. The database does not enforce it. Breaking it does not corrupt data, because the row trigger still enforces the status of the goal and the limit of 50 for these roles. It only loses deadlock freedom: a privileged writer that locks a competency row before the goal can deadlock with an `authenticated` writer that already holds the goal.
+  - The backend does not use these roles (section 6.1), so today the contract binds migrations and operators. It binds any new code that introduces such a role.
+  - Every migration or script that writes to `competencies` states in its header that it follows this contract. A change that adds a privileged writer needs a review against this rule.
+- **L3. The triggers must stay enabled for application writes.** `ALTER TABLE … DISABLE TRIGGER` and `session_replication_role = replica` are not used by the application or by data migrations. An application role cannot do either.
+- **L4. The statement lock relies on at most one active goal per user and on writes being allowed only in the active goal** (`one_active_goal_per_user` and the policies of section 6.2.1). If multiple active goals are ever introduced (section 9), this design must be revised first.
+- **Not required with this design:** limiting a request to one write statement. The lock is held until the transaction ends, so several statements in one transaction stay safe for `authenticated`.
+
+**Consequences.** All writes to the competencies of one goal are serialised. The MVP has one active goal per user, so this only affects the same user's own concurrent requests (double clicks, several tabs). Even a statement that changes zero rows takes the goal lock. The lock writes a mark on the goal row (WAL), which is negligible at this scale. A waiting statement is bounded by the `statement_timeout` of 15 s of `skillloop_api` (SQLSTATE `57014`, reported as `504 DATABASE_TIMEOUT`). Reads are never blocked. Concurrent `PATCH` or archiving of the goal waits for a running competency write and vice versa.
+
+**Deletion.** The triggers of this section exist for INSERT and UPDATE only. Clients have no DELETE grant, so competencies disappear only through the cascade `auth.users` → `career_goals` → `competencies` (section 8; not an approved deletion policy) or through a privileged role, which is bound by rule L2. In the cascade the goal row is deleted first and the competencies afterwards, as an action of the same statement, which is the order *goal, then competencies* that this design requires. A concurrent edit by `authenticated` waits for the goal lock before it touches any competency row, so it cannot hold a competency row that the cascade needs. A real cascade is tested in T5b.
+
+**Errors and how the backend handles them (implemented in Stages 9.2–9.3):**
+
+|SQLSTATE and constraint|Meaning|Backend result|
+|---|---|---|
+|`23514`, `competencies_active_limit`|50 active competencies already|`409 COMPETENCY_LIMIT_REACHED`|
+|`23514`, `competencies_goal_not_active`|The goal is archived, missing or not the user's. The trigger cannot tell these apart, because the lock query cannot see an archived or a foreign goal.|The transaction is rolled back, then the service reads the goal in a new transaction. **Add a competency** (the goal id comes from the path): archived → `409 GOAL_ARCHIVED`; not visible → `404 GOAL_NOT_FOUND`. **Edit or archive a competency:** the UPDATE had found the row, so the goal exists and is the user's; the cause is a race with the archiving of the goal → `409 GOAL_ARCHIVED` (confirmed by the read)|
+|`23505`, `competencies_active_name_unique`|The active name is taken|`409 COMPETENCY_NAME_EXISTS`|
+|Zero rows from an UPDATE|Missing, not the user's, archived, or in an archived goal|The service reads, in this order: (1) the competency: not visible → `404 COMPETENCY_NOT_FOUND`; (2) its status is `archived` → `409 COMPETENCY_ARCHIVED`; (3) its goal: archived → `409 GOAL_ARCHIVED`. If the goal is active as well, the state is inconsistent (the row should have been updated) and the answer is `500`, as for goals (section 4.3.1)|
+|`40P01` (deadlock), `40001` (serialization failure)|Not expected for `authenticated` writes with this design; kept as a safety net|**Retryable.** The backend repeats the whole user transaction a small, bounded number of times (the number is fixed in Stage 9.2). If it still fails, the answer is `503 SERVICE_UNAVAILABLE`.|
+|`57014`|Statement timeout, for example a long wait for the lock|`504 DATABASE_TIMEOUT`|
+
+**Assumptions that must be proven by the Stage 9.1 tests (none is assumed to hold):**
+
+1. A locking read through Row Level Security is evaluated again after the wait, so a goal archived in the meantime is no longer returned (test T3).
+2. `auth.uid()` works inside the statement trigger for `authenticated`, and `authenticated` can lock its own goal and cannot lock an archived or a foreign one.
+3. The `WITH CHECK` of an INSERT policy runs after the `BEFORE ROW` trigger, so an INSERT into an archived or a foreign goal fails with `23514`, not `42501`.
+4. The row count query in the row trigger sees the rows that the same multi-row INSERT has already inserted.
+5. A tuple lock taken before the trigger does not make another transaction's unique-index check wait (test T1).
+6. No test depends on the order in which PostgreSQL grants a lock to waiting transactions: that order is not guaranteed. Where several transactions wait, the tests assert only what holds in every order: no deadlock, every transaction ends within the time limit, and the final data equals the result of some serial order of the operations. A wait is asserted (with `pg_blocking_pids`) only where one transaction deterministically has to wait for another that is known to hold the lock.
+7. A real `DELETE` of a goal removes its competencies through `ON DELETE CASCADE` after the goal row has been deleted and in the same statement, and a concurrent edit by `authenticated` is blocked at the statement trigger until the deleting transaction ends, without a deadlock (test T5b).
+8. `deadlock_timeout` detection and the `statement_timeout` of 15 s bound every test.
+
+If an assumption does not hold, the work stops and the problem is reported. The fallbacks are a variant without the `UPDATE` guard, or `SECURITY DEFINER`; the latter only with a separate approval.
+
 ## 5. Proficiency and Assessment Principles
 
 SkillLoop distinguishes between three concepts:
@@ -397,6 +501,8 @@ The current proficiency scale consists of four states:
 - The user should be able to see their current level and historical progress.
     
 
+The table `competencies` stores only the **expected** level of a competency (section 4.3). The current proficiency is not stored there (approved in Stage 9.0): it will be derived from the assessment history when the assessment tables exist.
+
 The exact proficiency calculation algorithm will be specified separately. It should consider assessment quality and history rather than relying on a single answer.
 
 ## 6. Data Ownership and Security
@@ -431,7 +537,7 @@ Migration: `20261115160519_create_api_role.sql`. Backend: `backend/app/db/sessio
 |`skillloop_api`|The only role the backend logs in with (through the Supavisor session pooler)|None on its own|
 |`authenticated`|Acting on behalf of a signed-in user; Row Level Security applies to it|The minimum granted per table, see 6.2|
 |`anon`|Unauthenticated requests (relevant to the Data API)|None|
-|`service_role`|Keeps Supabase's default privileges; the migrations do not change them|Not used by the backend, which refuses any `DATABASE_URL` that does not log in as `skillloop_api`|
+|`service_role`|Keeps Supabase's default privileges; the migrations do not change them|Not used by the backend, which refuses any `DATABASE_URL` that does not log in as `skillloop_api`. Any write by `postgres` or `service_role` to `competencies` must follow the mandatory contract of section 4.8 (rule L2)|
 
 **The role `skillloop_api`:**
 
@@ -484,11 +590,31 @@ Notes:
 - Every policy writes the check as `(select auth.uid())`, as a sub-select.
 - Column grants mean that `id`, `created_at` and `updated_at` (and `user_id` on UPDATE) can never be written by a client.
 
+#### 6.2.1 competencies — Planned
+
+Approved in Stage 9.0; no migration exists yet. The pattern is that of `career_goals`: `REVOKE ALL` from `public`, `anon` and `authenticated` first, then only the minimum is granted to `authenticated`. `anon` and `skillloop_api` get nothing. There is no change to the grants of any existing table.
+
+|Command|Grant to `authenticated`|Policy|
+|---|---|---|
+|SELECT|whole table|`competencies_select_own`: `user_id = (select auth.uid())`, any status, also in an archived goal|
+|INSERT|columns `career_goal_id`, `user_id`, `name`, `description`, `rationale`, `category`, `knowledge_type`, `importance`, `expected_level`, `display_order`|`competencies_insert_own`: `WITH CHECK` `user_id = (select auth.uid())`, `status = 'active'`, and an active goal of the same user with `id = career_goal_id` exists|
+|UPDATE|columns `name`, `description`, `rationale`, `category`, `knowledge_type`, `importance`, `expected_level`, `display_order`, `status`|`competencies_update_own`: `USING` `user_id = (select auth.uid())`, `status = 'active'`, and an active goal of the same user exists; `WITH CHECK` `user_id = (select auth.uid())` and an active goal of the same user exists|
+|DELETE|none|none|
+
+Notes:
+
+- `status` is not insertable: a competency is always created `active` (the column default). `id`, `career_goal_id`, `user_id`, `created_at` and `updated_at` can never be changed by a client after creation, so a competency cannot be moved to another goal or user.
+- `USING` of the UPDATE policy applies to the existing row: an archived competency, and any competency of an archived goal, is invisible to UPDATE (zero rows). `WITH CHECK` sees the new row; with the `status` CHECK constraint it allows `active` → `archived`. Nothing allows `archived` → `active`.
+- The "active goal exists" part is an `EXISTS` subquery on `career_goals`. It is evaluated with the snapshot of the statement. The trigger of section 4.8 repeats the check after the lock is granted, which is what closes the race with archiving.
+- INSERT: the row trigger runs before the `WITH CHECK`, so an INSERT into an archived or a foreign goal fails in the trigger (`23514`), not in the policy (`42501`). To test the policy as a separate barrier, the pgTAP test disables the trigger inside its own rolled-back transaction.
+- Two or three independent barriers protect each command: the grant, the policy, and for the goal-related rules the trigger and the composite foreign key. The tests check them separately.
+- The baseline test `00_security_baseline.test.sql` already requires Row Level Security on every table in `public`, no privileges for `anon`, no `TRUNCATE`, `REFERENCES` or `TRIGGER` for `authenticated`, and no executable functions for the API roles; the new table and functions must pass it unchanged.
+
 ### 6.3 Data API (PostgREST) — Implemented configuration, scope not decided
 
 `supabase/config.toml` has `[api] enabled = true` with `schemas = ["public", "graphql_public"]`. The tables in `public` can therefore be reached through the Data API as well as through the backend. The database does not rely on the Data API being disabled: Row Level Security and the grants above are the barrier for both paths, and `anon` has no access. The migration of `career_goals` says the same.
 
-This reflects the **local** configuration. The configuration of any remote Supabase project was not checked and is **unverified**. Whether the Data API should stay exposed is an open decision (section 8.3).
+This reflects the **local** configuration. The configuration of any remote Supabase project was not checked and is **unverified**. Whether the Data API should stay exposed is an open decision (section 8.3). Because the Data API accepts every statement that the grants and policies allow, the rules for competencies (sections 4.3.1 and 4.8) are written as database rules, so they also hold for multi-row statements sent through it.
 
 ## 7. Indexes and Constraints
 
@@ -505,7 +631,7 @@ This reflects the **local** configuration. The configuration of any remote Supab
 
 |Table|Index|
 |---|---|
-|competencies|career_goal_id, status|
+|competencies|`(career_goal_id, status, display_order)` and the unique partial index `competencies_active_name_unique` (section 4.3)|
 |learning_sessions|user_id, created_at|
 |learning_sessions|career_goal_id, session_type|
 |session_items|learning_session_id|
@@ -531,8 +657,8 @@ create unique index one_active_goal_per_user
 **Recommended for the planned tables (Planned):**
 
 - Foreign keys for all entity relationships.
-- `expected_level` restricted to beginner, intermediate or advanced.
-- `current_level` restricted to not_assessed, beginner, intermediate or advanced.
+- `competencies`: the keys, constraints and indexes are specified in section 4.3; `expected_level` is restricted to beginner, intermediate or advanced.
+- `current_level` is not stored in `competencies` (section 4.3); the scale of the assessments belongs to the open decision 5 in section 8.3.
 - `score` within a range that is still to be confirmed (this document says 0–100; see the open decision 5 in section 8.3).
 - Controlled values for status, session type and knowledge type.
 
@@ -551,17 +677,18 @@ The cascade is **the current technical state of the migrations. It is not an app
 
 The MVP should preserve learning history.
 
-- Archiving a career goal does not delete its competencies or sessions.
+- Archiving a career goal does not delete its competencies or sessions. It freezes its competencies: they stay readable and cannot be changed (section 4.3).
+- Archiving a competency is one-way. Archived competencies are never deleted by clients and never become active again.
 - Archiving a competency does not delete previous assessments.
 - New evaluations create new historical records.
 - Recommendations can be dismissed or completed without deleting them.
-- Deleting a user account must follow an explicit data deletion policy. What happens to the planned tables on deletion (for example the rule of their foreign keys to `auth.users` and to each other) has not been decided.
+- Deleting a user account must follow an explicit data deletion policy. What happens to the planned tables on deletion (for example the rule of their foreign keys to `auth.users` and to each other) has not been decided. For `competencies` the planned behaviour is the same cascade as for goals (`auth.users` → `career_goals` → `competencies`). It is a technical consequence of the planned foreign keys and **not an approved policy**.
 
 ### 8.3 Open decisions
 
 These are **not decided** by this document or by the migrations.
 
-1. **Account and data deletion policy.** The current cascade is not an approved policy. No endpoint deletes an account. The decision determines what happens to goals, and later to sessions, answers and evaluations, when an account is removed, and the foreign-key rules of the planned tables.
+1. **Account and data deletion policy.** The current cascade is not an approved policy. No endpoint deletes an account. The decision determines what happens to goals, and later to sessions, answers and evaluations, when an account is removed, and the foreign-key rules of the planned tables, including the cascade through `career_goals` to `competencies` and the foreign keys of future tables to `competencies`.
 2. **Formal approval of D13** (an archived goal is immutable and never becomes active again). It is implemented and tested and is referred to as D13 in migrations and tests, but this repository has no decision record for it.
 3. **Scope of the Data API (PostgREST).** The local configuration exposes schema `public`. Whether it should stay exposed, and the state of any remote project, is undecided and unverified.
 4. **Restricting `preferred_language` to `en` and `pl`.** The database enforces it with a CHECK constraint, so adding a language needs a migration. Whether the list and the database-level enforcement are intended is not confirmed.
@@ -602,7 +729,7 @@ Status of the suggested sequence:
 |1a. Create the `skillloop_api` role and safe default privileges|Implemented (`20261115160519_create_api_role.sql`)|
 |2. Create `profiles`|Implemented (`20261115172015_create_profiles.sql`)|
 |3. Create `career_goals`|Implemented (`20261115173804_create_career_goals.sql`)|
-|4. Create `competencies`|Planned|
+|4. Create `competencies`|Planned. The design was approved in Stage 9.0; the migration is Stage 9.1a and its tests are Stages 9.1a and 9.1b (`IMPLEMENTATION-PLAN.md`)|
 |5. Create `learning_sessions`|Planned|
 |6. Create `session_items`|Planned; blocked by open decision 5 in section 8.3|
 |7. Create `recommendations`|Planned|
@@ -612,6 +739,6 @@ Status of the suggested sequence:
 
 ---
 
-**Document status:** Draft v1.2
+**Document status:** Draft v1.3
 
-**Next step:** Resolve the open decisions in section 8.3, in particular decision 5 (assessment scale and statuses), before creating the migrations of the planned tables.
+**Next step:** Resolve the open decisions in section 8.3, in particular decision 5 (assessment scale and statuses), before creating the migrations of the planned tables. The migration of `competencies` (Stage 9.1) does not depend on decision 5 and waits only for the acceptance of the Stage 9.0 documentation; decision 5 still blocks `session_items`.

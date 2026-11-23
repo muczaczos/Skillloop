@@ -1,6 +1,6 @@
 
 **Project:** SkillLoop  
-**Version:** 1.0  
+**Version:** 1.1  
 **Status:** Draft  
 **API Style:** REST  
 **Backend:** Python + FastAPI  
@@ -109,7 +109,7 @@ FastAPI does not implement its own password management or token generation.
 |Career Goal|PATCH|`/career-goals/{id}`|Update career goal|
 |Career Goal|POST|`/career-goals/{id}/archive`|Archive career goal|
 |Competencies|GET|`/career-goals/{id}/competencies`|List competencies|
-|Competencies|POST|`/career-goals/{id}/competencies/generate`|Generate competency map|
+|Competencies|POST|`/career-goals/{id}/competencies/generate`|Generate competency map (deferred: AI stage, not in Stage 9)|
 |Competencies|POST|`/career-goals/{id}/competencies`|Add competency|
 |Competencies|PATCH|`/competencies/{id}`|Update competency|
 |Competencies|POST|`/competencies/{id}/archive`|Archive competency|
@@ -131,6 +131,8 @@ FastAPI does not implement its own password management or token generation.
 |Speech|POST|`/speech/transcriptions`|Transcribe audio|
 
 This is the proposed MVP endpoint set. Some endpoints may be combined or simplified during implementation if that does not weaken the API contract.
+
+Competency endpoints: `GET` and `POST` are planned for Stage 9.2, `PATCH` and `archive` for Stage 9.3, and `generate` is deferred to the AI stage. Details are in section 7.
 
 ## 5. Profile API
 
@@ -244,19 +246,113 @@ Errors: `401`, `404 GOAL_NOT_FOUND`, `409 GOAL_ARCHIVED`, `422` (invalid id), `5
 
 ## 7. Competency API
 
-### POST `/career-goals/{id}/competencies/generate`
+**Status: Planned.** The contract below was approved in Stage 9.0. Stage 9 delivers the **manual** competency map only: `GET` and `POST` in Stage 9.2, `PATCH` and `archive` in Stage 9.3. AI generation (`/competencies/generate`) and saving a whole map in one request are **deferred** (see the end of this section). No competency endpoint exists yet. The data model, the rules and the database behaviour in special situations are in `DATABASE-DESIGN.md` (sections 4.3, 4.3.1 and 4.8).
 
-Requests an AI-generated competency map.
+Conventions are those of section 6: identifiers come from the path, the user from the verified token; the request models reject unknown fields (`user_id`, `career_goal_id`, `status`, `id`); a resource of another user is indistinguishable from a missing one (`404`).
+
+### The competency object
+
+```
+{
+  "id": "uuid",
+  "career_goal_id": "uuid",
+  "name": "Docker",
+  "description": "Understanding containerization.",
+  "rationale": "Docker is commonly used to package and deploy applications.",
+  "category": "Containers",
+  "knowledge_type": "application",
+  "importance": "high",
+  "expected_level": "intermediate",
+  "display_order": 0,
+  "status": "active",
+  "created_at": "2026-11-23T10:00:00Z",
+  "updated_at": "2026-11-23T10:00:00Z"
+}
+```
+
+The response never contains `user_id`. Field limits: `name` 1–100 characters, `description` and `rationale` at most 1000, `category` 1–60, `display_order` an integer `>= 0`. Surrounding whitespace is ignored for the length and for the uniqueness of `name`. `knowledge_type` is `memory`, `application` or `documentation`; `importance` is `critical`, `high`, `medium` or `low`; `expected_level` is `beginner`, `intermediate` or `advanced`.
+
+`knowledge_type` states what the role **requires**, not what the user has shown. In particular `application` does not mean proven practical proficiency (`DATABASE-DESIGN.md`, section 4.3).
+
+### GET `/career-goals/{goal_id}/competencies` (Stage 9.2)
+
+Returns every competency of the goal, active and archived, in the order `display_order`, `created_at`, `id`. It also works for an archived goal (its competencies are frozen, not hidden). There is no pagination in the MVP; the number of archived competencies is not limited (accepted).
+
+Response `200`:
+
+```
+{
+  "competencies": [ { ...competency object... } ]
+}
+```
+
+Errors: `401`, `404 GOAL_NOT_FOUND`, `422` (invalid id), `503`, `504`.
+
+### POST `/career-goals/{goal_id}/competencies` (Stage 9.2)
+
+Adds **one** competency to an **active** goal of the user.
 
 Request:
 
 ```
 {
-  "additional_context": "I have experience with Linux, Docker and Python."
+  "name": "Terraform",
+  "description": "Infrastructure as Code.",
+  "rationale": "Infrastructure is usually defined as code.",
+  "category": "IaC",
+  "knowledge_type": "application",
+  "importance": "high",
+  "expected_level": "intermediate",
+  "display_order": 4
 }
 ```
 
-Response:
+Required: `name`, `knowledge_type`, `importance`, `expected_level`. Optional: `description`, `rationale`, `category`, `display_order` (default `0`). The competency is always created `active`.
+
+Response `201`: the competency object.
+
+Rules:
+
+- At most **50 active** competencies per goal; the 51st is refused with `409 COMPETENCY_LIMIT_REACHED`. Archived competencies do not count.
+- The name of an active competency is unique within the goal, ignoring case: otherwise `409 COMPETENCY_NAME_EXISTS`. An archived competency releases its name.
+- A goal that is archived: `409 GOAL_ARCHIVED`. A goal that is missing or belongs to another user: `404 GOAL_NOT_FOUND`. This also applies when the user has no active goal.
+
+Errors: `401`, `404 GOAL_NOT_FOUND`, `409 GOAL_ARCHIVED`, `409 COMPETENCY_NAME_EXISTS`, `409 COMPETENCY_LIMIT_REACHED`, `422`, `503`, `504`.
+
+### PATCH `/competencies/{competency_id}` (Stage 9.3)
+
+Updates one **active** competency in an **active** goal. Fields that are left out are not changed; at least one field is required. `description`, `rationale` and `category` may be `null` to clear them; `name`, `knowledge_type`, `importance`, `expected_level` and `display_order` may not be `null`. `status`, `career_goal_id` and `user_id` cannot be sent: a competency is archived only through the archive endpoint and never moves to another goal.
+
+Response `200`: the updated competency.
+
+Errors: `401`, `404 COMPETENCY_NOT_FOUND`, `409 COMPETENCY_ARCHIVED`, `409 GOAL_ARCHIVED`, `409 COMPETENCY_NAME_EXISTS`, `422`, `503`, `504`.
+
+### POST `/competencies/{competency_id}/archive` (Stage 9.3)
+
+Archives one active competency and returns it (`200`, status `archived`). Archiving is one-way: an archived competency is immutable and never becomes active again. Its historical assessment data is never deleted. Archiving frees one of the 50 slots and releases the name.
+
+Errors: `401`, `404 COMPETENCY_NOT_FOUND`, `409 COMPETENCY_ARCHIVED`, `409 GOAL_ARCHIVED`, `422` (invalid id), `503`, `504`.
+
+### Rules that apply to all competency endpoints
+
+- **Ownership.** A competency or goal of another user is indistinguishable from a missing one (`404`). The user id is never taken from the request.
+- **No active goal.** Without an active goal no competency can be added, edited or archived. Reading the competencies of the user's own archived goal still works.
+- **Frozen competencies.** When a goal is archived, its competencies can no longer be added, edited or archived. They stay readable.
+- **Error precedence.** The order follows what the backend is able to recognise, given Row Level Security (the owner can read their own competencies and goals in every status, and cannot see anyone else's). Request validation (`422`) always comes first.
+  - **Edit or archive a competency.** The backend finds out why nothing was changed by reading, in this order: (1) the competency is not visible (missing or another user's) → `404 COMPETENCY_NOT_FOUND`; (2) it is itself archived → `409 COMPETENCY_ARCHIVED`; (3) its goal is archived → `409 GOAL_ARCHIVED`. A competency that is archived and sits in an archived goal therefore answers `COMPETENCY_ARCHIVED`: the resource that was addressed is reported before its parent. A rename that collides with another name is reported (`409 COMPETENCY_NAME_EXISTS`) only for a competency that can be changed, so it never hides the answers above.
+  - **Add a competency.** (1) The goal is not visible (missing, another user's) → `404 GOAL_NOT_FOUND`; (2) the goal is archived → `409 GOAL_ARCHIVED`; (3) the goal already has 50 active competencies → `409 COMPETENCY_LIMIT_REACHED`; (4) the name is taken → `409 COMPETENCY_NAME_EXISTS`. The database evaluates the goal and the limit in a trigger before it checks the unique index, so a request that would break both rules answers `COMPETENCY_LIMIT_REACHED`. The database cannot tell a missing goal from an archived one in its own error, so the backend reads the goal after a failure to choose between (1) and (2).
+- **One resource per request.** The API adds, changes or archives one competency per request. Statements that touch several rows are not part of the API. They remain possible through the Data API, and the database handles them atomically (`DATABASE-DESIGN.md`, section 4.3.1): the whole statement succeeds or nothing changes.
+- **Concurrency.** Writes to the competencies of one goal are serialised in the database (`DATABASE-DESIGN.md`, section 4.8), so concurrent requests cannot exceed the limit or write into a goal that has just been archived. A deadlock (`40P01`) or a serialization failure (`40001`) is treated as **retryable**: the backend repeats the whole transaction a small, bounded number of times and answers `503 SERVICE_UNAVAILABLE` if it still fails. A statement that waits longer than the statement timeout answers `504 DATABASE_TIMEOUT`.
+
+### Deferred: AI generation and saving a whole map
+
+These parts are **not** part of Stage 9 and are kept only as a design for the AI stage (Phase 2B).
+
+`POST /career-goals/{goal_id}/competencies/generate` requests an AI-generated competency map. The generated map is returned as a proposal that is **not** saved; the user must be able to review and edit it before it is stored. When it is implemented, the proposal will also carry the `source` of each competency (a column that does not exist yet) and the endpoint that saves an approved map will be specified together with it. Sketch of the request and of the response:
+
+```
+{ "additional_context": "I have experience with Linux, Docker and Python." }
+```
 
 ```
 {
@@ -268,50 +364,10 @@ Response:
       "knowledge_type": "application",
       "importance": "critical",
       "expected_level": "intermediate"
-    },
-    {
-      "name": "Docker",
-      "description": "Understanding containerization.",
-      "rationale": "Docker is commonly used to package and deploy applications.",
-      "knowledge_type": "application",
-      "importance": "high",
-      "expected_level": "intermediate"
     }
   ]
 }
 ```
-
-The generated map is initially returned as a proposal.
-
-The user must be able to review and edit it before the competencies are saved as their active map.
-
-### POST `/career-goals/{id}/competencies`
-
-Adds a user-approved competency.
-
-Request:
-
-```
-{
-  "name": "Terraform",
-  "description": "Infrastructure as Code.",
-  "knowledge_type": "application",
-  "importance": "high",
-  "expected_level": "intermediate"
-}
-```
-
-### GET `/career-goals/{id}/competencies`
-
-Returns all competencies belonging to the career goal.
-
-### PATCH `/competencies/{id}`
-
-Updates competency information.
-
-### POST `/competencies/{id}/archive`
-
-Archives a competency without deleting its historical assessment data.
 
 ## 8. Assessment API
 
@@ -691,6 +747,17 @@ Error codes in use:
 |504|`DATABASE_TIMEOUT`|The database exceeded its statement timeout. Possible on every endpoint that uses the database.|
 |500|`INTERNAL_ERROR`|An unexpected database failure. The response for other unhandled exceptions is not yet specified.|
 
+Planned error codes of the competency endpoints (Stages 9.2–9.3; they are not in use yet):
+
+|Status|Code|When|
+|---|---|---|
+|404|`COMPETENCY_NOT_FOUND`|The competency does not exist or belongs to another user.|
+|409|`COMPETENCY_ARCHIVED`|The competency is archived and can no longer be changed.|
+|409|`COMPETENCY_NAME_EXISTS`|An active competency with this name (ignoring case) already exists in the goal.|
+|409|`COMPETENCY_LIMIT_REACHED`|The goal already has 50 active competencies.|
+
+`GOAL_NOT_FOUND` and `GOAL_ARCHIVED` are reused. A deadlock or a serialization failure in the database is retried by the backend; if it still fails, the answer is `503 SERVICE_UNAVAILABLE` (section 7).
+
 Recommended HTTP status codes:
 
 |Status|Meaning|
@@ -797,7 +864,7 @@ Suggested implementation sequence:
     
 4. Implement career goal endpoints.
     
-5. Implement competency endpoints.
+5. Implement competency endpoints (Stage 9: manual CRUD; AI generation in a later stage).
     
 6. Implement diagnostic assessment endpoints.
     
@@ -816,6 +883,6 @@ Suggested implementation sequence:
 
 ---
 
-**Document status:** Draft v1.0
+**Document status:** Draft v1.1
 
 **Next step:** Define the implementation plan, including development phases, dependencies, testing and deployment milestones.
