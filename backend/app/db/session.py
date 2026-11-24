@@ -17,17 +17,34 @@ resets and verifies every returned connection (see app/db/pool.py).
 """
 
 import json
-from collections.abc import Iterator
+import logging
+import random
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 
 from psycopg import Connection
+from psycopg.errors import DeadlockDetected, SerializationFailure
 from psycopg_pool import ConnectionPool
 
-from app.db.errors import translate_db_errors
+from app.db.errors import DatabaseUnavailableError, translate_db_errors
 from app.models.auth import AuthenticatedUser
 
+logger = logging.getLogger(__name__)
+
 AUTHENTICATED_DB_ROLE = "authenticated"
+
+# run_user_transaction(): at most this many attempts in total (the first one and the retries).
+RETRY_MAX_ATTEMPTS = 3
+# A short random pause before a retry, so that two transactions that just collided do not
+# collide again at the same instant. Seconds; deliberately small.
+RETRY_PAUSE_MIN_SECONDS = 0.01
+RETRY_PAUSE_MAX_SECONDS = 0.05
+# The only failures that are retried: 40P01 deadlock_detected and 40001 serialization_failure.
+# PostgreSQL has already rolled the transaction back when it reports them, and running the same
+# work again in a new transaction is what it asks the client to do.
+RETRYABLE_ERRORS = (DeadlockDetected, SerializationFailure)
 
 # True while a user_transaction() is open in the current execution context. A ContextVar is
 # isolated per execution context (each thread has its own; a sync request handler run in the
@@ -102,3 +119,57 @@ def _bind_user(conn: Connection, user: AuthenticatedUser) -> None:
         raise UserContextMismatchError(
             "database user context does not match the authenticated user"
         )
+
+
+def run_user_transaction[ResultT](
+    pool: ConnectionPool,
+    user: AuthenticatedUser,
+    work: Callable[[Connection], ResultT],
+    *,
+    max_attempts: int = RETRY_MAX_ATTEMPTS,
+) -> ResultT:
+    """Run `work(conn)` in a user_transaction(), repeating the WHOLE transaction when PostgreSQL
+    reports a deadlock (40P01) or a serialization failure (40001).
+
+    Every attempt is a complete, new user_transaction(): a new connection checkout, BEGIN,
+    SET LOCAL ROLE authenticated and the claims of `user`. The exception is caught OUTSIDE the
+    `with` block, so by then user_transaction() has rolled the failed transaction back and
+    returned the connection to the pool (which resets it). The next attempt never starts before
+    that. A failure at COMMIT is handled the same way: nothing was committed, so nothing is
+    applied twice. Anything else, for example any other database error or an error of the
+    application, is raised at once and unchanged, without a retry. After `max_attempts` failed
+    attempts the answer is DatabaseUnavailableError, which the API reports as 503.
+
+    `work` must be safe to run more than once: everything it does has to happen inside the
+    transaction (database statements only). It must not send messages, call external services
+    or keep state between attempts, because an attempt that failed is rolled back but its side
+    effects outside the database are not.
+
+    Only code that really needs this uses it (writes to competencies); user_transaction()
+    itself and the existing services are unchanged.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with user_transaction(pool, user) as conn:
+                return work(conn)
+        except RETRYABLE_ERRORS as exc:
+            # Only the SQLSTATE is logged or reported: the message of such an error can hold
+            # SQL text and row values.
+            sqlstate = exc.sqlstate
+            if attempt == max_attempts:
+                logger.error(
+                    "transaction failed after %d attempts (SQLSTATE %s)", max_attempts, sqlstate
+                )
+                raise DatabaseUnavailableError(
+                    f"database unavailable (SQLSTATE {sqlstate}, {max_attempts} attempts)"
+                ) from exc
+            logger.warning(
+                "transaction attempt %d of %d failed (SQLSTATE %s); retrying",
+                attempt,
+                max_attempts,
+                sqlstate,
+            )
+            time.sleep(random.uniform(RETRY_PAUSE_MIN_SECONDS, RETRY_PAUSE_MAX_SECONDS))
+    raise AssertionError("unreachable: the last attempt returns or raises")  # pragma: no cover
