@@ -159,7 +159,12 @@ def test_updates_with_a_forbidden_column_never_reach_the_database(bad: str) -> N
 
 def _modules() -> list[Path]:
     modules = sorted(p for p in REPOSITORY_DIR.glob("*.py") if p.name != "__init__.py")
-    assert {p.name for p in modules} == {"_sql.py", "career_goals.py", "profiles.py"}
+    assert {p.name for p in modules} == {
+        "_sql.py",
+        "career_goals.py",
+        "competencies.py",
+        "profiles.py",
+    }
     return modules
 
 
@@ -279,7 +284,7 @@ def test_repositories_do_not_manage_transactions_connections_or_roles(module: Pa
         assert not forbidden.search(literal), literal
 
 
-@pytest.mark.parametrize("module", ["profiles.py", "career_goals.py"])
+@pytest.mark.parametrize("module", ["profiles.py", "career_goals.py", "competencies.py"])
 def test_sql_is_never_built_with_f_strings_or_concatenation(module: str) -> None:
     tree = ast.parse((REPOSITORY_DIR / module).read_text())
 

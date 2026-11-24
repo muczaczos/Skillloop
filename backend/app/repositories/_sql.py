@@ -17,6 +17,15 @@ def fetch_one[RecordT: BaseModel](
         return cur.fetchone()
 
 
+def fetch_all[RecordT: BaseModel](
+    conn: Connection, record_type: type[RecordT], query: sql.Composable, params: Sequence[Any]
+) -> list[RecordT]:
+    """Run a query and map every row to a record (an empty list if there is none)."""
+    with conn.cursor(row_factory=class_row(record_type)) as cur:
+        cur.execute(query, params)
+        return cur.fetchall()
+
+
 def set_clause(
     changes: Mapping[str, Any], allowed: Collection[str]
 ) -> tuple[sql.Composable, list[Any]]:
