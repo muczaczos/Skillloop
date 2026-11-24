@@ -54,3 +54,19 @@ class GoalArchivedError(AppError):
     status_code = 409
     code = "GOAL_ARCHIVED"
     default_message = "The career goal is archived and can no longer be changed."
+
+
+class CompetencyLimitReachedError(AppError):
+    """The goal already has the maximum number of active competencies (competencies_active_limit)."""
+
+    status_code = 409
+    code = "COMPETENCY_LIMIT_REACHED"
+    default_message = "The career goal already has the maximum number of active competencies."
+
+
+class CompetencyNameExistsError(AppError):
+    """An active competency of the goal already has this name (competencies_active_name_unique)."""
+
+    status_code = 409
+    code = "COMPETENCY_NAME_EXISTS"
+    default_message = "An active competency with this name already exists in the career goal."

@@ -6,6 +6,8 @@ from app.core import errors
 from app.core.errors import (
     ActiveGoalExistsError,
     AppError,
+    CompetencyLimitReachedError,
+    CompetencyNameExistsError,
     GoalArchivedError,
     GoalNotFoundError,
     NoActiveGoalError,
@@ -21,6 +23,8 @@ from app.core.errors import (
         (NoActiveGoalError, 404, "NO_ACTIVE_GOAL"),
         (ActiveGoalExistsError, 409, "ACTIVE_GOAL_EXISTS"),
         (GoalArchivedError, 409, "GOAL_ARCHIVED"),
+        (CompetencyLimitReachedError, 409, "COMPETENCY_LIMIT_REACHED"),
+        (CompetencyNameExistsError, 409, "COMPETENCY_NAME_EXISTS"),
     ],
 )
 def test_error_contract(error_class: type[AppError], status_code: int, code: str) -> None:
@@ -40,7 +44,7 @@ def test_codes_are_unique() -> None:
     subclasses = AppError.__subclasses__()
     codes = [cls.code for cls in subclasses]
 
-    assert len(codes) == len(set(codes)) == 5
+    assert len(codes) == len(set(codes)) == 7
 
 
 def test_errors_module_does_not_depend_on_fastapi() -> None:

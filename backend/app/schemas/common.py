@@ -15,6 +15,11 @@ from pydantic import AfterValidator, AwareDatetime, BaseModel, BeforeValidator, 
 TARGET_ROLE_MAX_LENGTH = 100  # career_goals_target_role_check
 GOAL_DESCRIPTION_MAX_LENGTH = 2000  # career_goals_description_check
 DISPLAY_NAME_MAX_LENGTH = 100  # profiles_display_name_check
+COMPETENCY_NAME_MAX_LENGTH = 100  # competencies_name_check
+COMPETENCY_TEXT_MAX_LENGTH = 1000  # competencies_description_check, competencies_rationale_check
+COMPETENCY_CATEGORY_MAX_LENGTH = 60  # competencies_category_check
+# competencies.display_order is a PostgreSQL integer (int4); the CHECK only forbids negatives.
+DISPLAY_ORDER_MAX = 2_147_483_647
 
 
 def _clean(value: Any) -> Any:
@@ -51,6 +56,24 @@ GoalDescription = Annotated[
     Annotated[str, Field(max_length=GOAL_DESCRIPTION_MAX_LENGTH)] | None,
     BeforeValidator(_clean_optional),
 ]
+
+
+CompetencyName = Annotated[
+    str,
+    BeforeValidator(_clean),
+    Field(min_length=1, max_length=COMPETENCY_NAME_MAX_LENGTH),
+]
+# Optional texts: text that is empty after stripping means "no value" (None), like GoalDescription.
+CompetencyText = Annotated[
+    Annotated[str, Field(max_length=COMPETENCY_TEXT_MAX_LENGTH)] | None,
+    BeforeValidator(_clean_optional),
+]
+CompetencyCategory = Annotated[
+    Annotated[str, Field(max_length=COMPETENCY_CATEGORY_MAX_LENGTH)] | None,
+    BeforeValidator(_clean_optional),
+]
+# strict: only a JSON integer is accepted, not "5", 5.0 or true.
+DisplayOrder = Annotated[int, Field(strict=True, ge=0, le=DISPLAY_ORDER_MAX)]
 
 
 def _to_utc(value: datetime) -> datetime:
