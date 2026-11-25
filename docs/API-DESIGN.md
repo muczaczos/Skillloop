@@ -108,11 +108,11 @@ FastAPI does not implement its own password management or token generation.
 |Career Goal|GET|`/career-goals/active`|Get active career goal|
 |Career Goal|PATCH|`/career-goals/{id}`|Update career goal|
 |Career Goal|POST|`/career-goals/{id}/archive`|Archive career goal|
-|Competencies|GET|`/career-goals/{id}/competencies`|List competencies|
+|Competencies|GET|`/career-goals/{id}/competencies`|List competencies (implemented, Stage 9.2)|
 |Competencies|POST|`/career-goals/{id}/competencies/generate`|Generate competency map (deferred: AI stage, not in Stage 9)|
-|Competencies|POST|`/career-goals/{id}/competencies`|Add competency|
-|Competencies|PATCH|`/competencies/{id}`|Update competency|
-|Competencies|POST|`/competencies/{id}/archive`|Archive competency|
+|Competencies|POST|`/career-goals/{id}/competencies`|Add competency (implemented, Stage 9.2)|
+|Competencies|PATCH|`/competencies/{id}`|Update competency (planned, Stage 9.3)|
+|Competencies|POST|`/competencies/{id}/archive`|Archive competency (planned, Stage 9.3)|
 |Assessment|POST|`/assessments/diagnostic`|Start initial diagnostic|
 |Assessment|POST|`/assessments/{id}/items`|Generate next diagnostic question|
 |Assessment|GET|`/assessments/{id}`|Get assessment state|
@@ -132,7 +132,7 @@ FastAPI does not implement its own password management or token generation.
 
 This is the proposed MVP endpoint set. Some endpoints may be combined or simplified during implementation if that does not weaken the API contract.
 
-Competency endpoints: `GET` and `POST` are planned for Stage 9.2, `PATCH` and `archive` for Stage 9.3, and `generate` is deferred to the AI stage. Details are in section 7.
+Competency endpoints: `GET` and `POST` are implemented (Stage 9.2), `PATCH` and `archive` are planned for Stage 9.3, and `generate` is deferred to the AI stage. Details are in section 7.
 
 ## 5. Profile API
 
@@ -246,7 +246,17 @@ Errors: `401`, `404 GOAL_NOT_FOUND`, `409 GOAL_ARCHIVED`, `422` (invalid id), `5
 
 ## 7. Competency API
 
-**Status: Planned.** The contract below was approved in Stage 9.0. Stage 9 delivers the **manual** competency map only: `GET` and `POST` in Stage 9.2, `PATCH` and `archive` in Stage 9.3. AI generation (`/competencies/generate`) and saving a whole map in one request are **deferred** (see the end of this section). No competency endpoint exists yet. The data model, the rules and the database behaviour in special situations are in `DATABASE-DESIGN.md` (sections 4.3, 4.3.1 and 4.8).
+**Status: partly implemented.** The contract below was approved in Stage 9.0. Stage 9 delivers the **manual** competency map only.
+
+|Endpoint|Status|
+|---|---|
+|`GET /career-goals/{goal_id}/competencies`|**Implemented** (Stage 9.2)|
+|`POST /career-goals/{goal_id}/competencies`|**Implemented** (Stage 9.2)|
+|`PATCH /competencies/{competency_id}`|Planned (Stage 9.3), not available yet|
+|`POST /competencies/{competency_id}/archive`|Planned (Stage 9.3), not available yet|
+|`POST /career-goals/{goal_id}/competencies/generate` and saving a whole map|Deferred to the AI stage|
+
+The two implemented endpoints are in `backend/app/api/competencies.py`; the rules are applied by `competency_service` and the database. The data model, the rules and the database behaviour in special situations are in `DATABASE-DESIGN.md` (sections 4.3, 4.3.1 and 4.8).
 
 Conventions are those of section 6: identifiers come from the path, the user from the verified token; the request models reject unknown fields (`user_id`, `career_goal_id`, `status`, `id`); a resource of another user is indistinguishable from a missing one (`404`).
 
@@ -274,9 +284,9 @@ The response never contains `user_id`. Field limits: `name` 1–100 characters, 
 
 `knowledge_type` states what the role **requires**, not what the user has shown. In particular `application` does not mean proven practical proficiency (`DATABASE-DESIGN.md`, section 4.3).
 
-### GET `/career-goals/{goal_id}/competencies` (Stage 9.2)
+### GET `/career-goals/{goal_id}/competencies` (implemented, Stage 9.2)
 
-Returns every competency of the goal, active and archived, in the order `display_order`, `created_at`, `id`. It also works for an archived goal (its competencies are frozen, not hidden). There is no pagination in the MVP; the number of archived competencies is not limited (accepted).
+Returns every competency of the goal, active and archived, in the order `display_order`, `created_at`, `id`. It also works for an archived goal (its competencies are frozen, not hidden). There is no pagination or filtering in the MVP; the number of archived competencies is not limited (accepted). The list may be empty. An empty list is only returned for a goal that belongs to the user; otherwise the answer is `404 GOAL_NOT_FOUND`.
 
 Response `200`:
 
@@ -288,7 +298,7 @@ Response `200`:
 
 Errors: `401`, `404 GOAL_NOT_FOUND`, `422` (invalid id), `503`, `504`.
 
-### POST `/career-goals/{goal_id}/competencies` (Stage 9.2)
+### POST `/career-goals/{goal_id}/competencies` (implemented, Stage 9.2)
 
 Adds **one** competency to an **active** goal of the user.
 
@@ -309,7 +319,7 @@ Request:
 
 Required: `name`, `knowledge_type`, `importance`, `expected_level`. Optional: `description`, `rationale`, `category`, `display_order` (default `0`). The competency is always created `active`.
 
-Response `201`: the competency object.
+Response `201`: the competency object (status `active`, no `user_id`). There is no `Location` header.
 
 Rules:
 
@@ -319,7 +329,7 @@ Rules:
 
 Errors: `401`, `404 GOAL_NOT_FOUND`, `409 GOAL_ARCHIVED`, `409 COMPETENCY_NAME_EXISTS`, `409 COMPETENCY_LIMIT_REACHED`, `422`, `503`, `504`.
 
-### PATCH `/competencies/{competency_id}` (Stage 9.3)
+### PATCH `/competencies/{competency_id}` (planned, Stage 9.3: not implemented yet)
 
 Updates one **active** competency in an **active** goal. Fields that are left out are not changed; at least one field is required. `description`, `rationale` and `category` may be `null` to clear them; `name`, `knowledge_type`, `importance`, `expected_level` and `display_order` may not be `null`. `status`, `career_goal_id` and `user_id` cannot be sent: a competency is archived only through the archive endpoint and never moves to another goal.
 
@@ -327,7 +337,7 @@ Response `200`: the updated competency.
 
 Errors: `401`, `404 COMPETENCY_NOT_FOUND`, `409 COMPETENCY_ARCHIVED`, `409 GOAL_ARCHIVED`, `409 COMPETENCY_NAME_EXISTS`, `422`, `503`, `504`.
 
-### POST `/competencies/{competency_id}/archive` (Stage 9.3)
+### POST `/competencies/{competency_id}/archive` (planned, Stage 9.3: not implemented yet)
 
 Archives one active competency and returns it (`200`, status `archived`). Archiving is one-way: an archived competency is immutable and never becomes active again. Its historical assessment data is never deleted. Archiving frees one of the 50 slots and releases the name.
 
@@ -747,14 +757,19 @@ Error codes in use:
 |504|`DATABASE_TIMEOUT`|The database exceeded its statement timeout. Possible on every endpoint that uses the database.|
 |500|`INTERNAL_ERROR`|An unexpected database failure. The response for other unhandled exceptions is not yet specified.|
 
-Planned error codes of the competency endpoints (Stages 9.2–9.3; they are not in use yet):
+Error codes of the competency endpoints. `COMPETENCY_NAME_EXISTS` and `COMPETENCY_LIMIT_REACHED` are in use since Stage 9.2 (`POST /career-goals/{goal_id}/competencies`):
+
+|Status|Code|When|
+|---|---|---|
+|409|`COMPETENCY_NAME_EXISTS`|An active competency with this name (ignoring case) already exists in the goal.|
+|409|`COMPETENCY_LIMIT_REACHED`|The goal already has 50 active competencies.|
+
+Planned for Stage 9.3 (not in use yet):
 
 |Status|Code|When|
 |---|---|---|
 |404|`COMPETENCY_NOT_FOUND`|The competency does not exist or belongs to another user.|
 |409|`COMPETENCY_ARCHIVED`|The competency is archived and can no longer be changed.|
-|409|`COMPETENCY_NAME_EXISTS`|An active competency with this name (ignoring case) already exists in the goal.|
-|409|`COMPETENCY_LIMIT_REACHED`|The goal already has 50 active competencies.|
 
 `GOAL_NOT_FOUND` and `GOAL_ARCHIVED` are reused. A deadlock or a serialization failure in the database is retried by the backend; if it still fails, the answer is `503 SERVICE_UNAVAILABLE` (section 7).
 
