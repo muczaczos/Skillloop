@@ -1,4 +1,4 @@
-"""HTTP tests of GET and POST /api/v1/career-goals/{goal_id}/competencies, no database.
+"""HTTP tests of the competency endpoints (list, add, update, archive), no database.
 
 Requests go through the real application (`app.main.app`): routing, authentication dependency,
 request validation, response model and the central error handlers. Only the service layer is
@@ -19,15 +19,17 @@ import app.api.competencies as competencies_api
 from app import main
 from app.api.deps import get_current_user, get_db_pool
 from app.core.errors import (
+    CompetencyArchivedError,
     CompetencyLimitReachedError,
     CompetencyNameExistsError,
+    CompetencyNotFoundError,
     GoalArchivedError,
     GoalNotFoundError,
 )
 from app.db.errors import DatabaseUnavailableError
 from app.models.auth import AuthenticatedUser
 from app.models.competency import CompetencyRecord
-from app.schemas.competency import CompetencyCreate
+from app.schemas.competency import CompetencyCreate, CompetencyUpdate
 
 USER = AuthenticatedUser(id=UUID("11111111-1111-1111-1111-111111111111"))
 GOAL_ID = UUID("22222222-2222-2222-2222-222222222222")
@@ -87,6 +89,21 @@ class FakeService:
         self.calls: list[tuple[str, Any, Any, UUID, Any]] = []
         self.listed: list[CompetencyRecord] | BaseException = [record()]
         self.created: CompetencyRecord | BaseException = record()
+        self.changed: CompetencyRecord | BaseException = record()
+
+    def update_competency(
+        self, pool: Any, user: Any, competency_id: UUID, data: CompetencyUpdate
+    ) -> CompetencyRecord:
+        return self._change("update", pool, user, competency_id, data)
+
+    def archive_competency(self, pool: Any, user: Any, competency_id: UUID) -> CompetencyRecord:
+        return self._change("archive", pool, user, competency_id, None)
+
+    def _change(self, *call: Any) -> CompetencyRecord:
+        self.calls.append(call)
+        if isinstance(self.changed, BaseException):
+            raise self.changed
+        return self.changed
 
     def list_competencies(self, pool: Any, user: Any, goal_id: UUID) -> list[CompetencyRecord]:
         self.calls.append(("list", pool, user, goal_id, None))
@@ -112,6 +129,8 @@ def service(monkeypatch: pytest.MonkeyPatch) -> FakeService:
     monkeypatch.setattr(
         competencies_api.competency_service, "create_competency", fake.create_competency
     )
+    for name in ("update_competency", "archive_competency"):
+        monkeypatch.setattr(competencies_api.competency_service, name, getattr(fake, name))
     return fake
 
 
@@ -455,3 +474,156 @@ def test_a_database_timeout_is_504(client: TestClient, service: FakeService, met
     response = client.request(method.upper(), URL, json=VALID if method == "post" else None)
 
     assert_error(response, 504, "DATABASE_TIMEOUT")
+
+
+# --- PATCH /competencies/{id} and POST /competencies/{id}/archive ------------------------------
+
+ITEM_URL = f"/api/v1/competencies/{COMPETENCY_ID}"
+ARCHIVE_URL = f"{ITEM_URL}/archive"
+
+
+def patch_item(client: TestClient) -> Any:
+    return client.patch(ITEM_URL, json={"name": "Git"})
+
+
+def archive_item(client: TestClient) -> Any:
+    return client.post(ARCHIVE_URL)
+
+
+ITEM_CALLS = pytest.mark.parametrize("call", [patch_item, archive_item], ids=["patch", "archive"])
+
+
+def test_the_item_handlers_are_plain_functions() -> None:
+    assert not inspect.iscoroutinefunction(competencies_api.update_competency)
+    assert not inspect.iscoroutinefunction(competencies_api.archive_competency)
+
+
+@pytest.mark.parametrize(
+    ("method", "url", "allow"),
+    [
+        ("get", ITEM_URL, "PATCH"),
+        ("delete", ITEM_URL, "PATCH"),
+        ("put", ITEM_URL, "PATCH"),
+        ("get", ARCHIVE_URL, "POST"),
+        ("patch", ARCHIVE_URL, "POST"),
+    ],
+)
+def test_other_methods_of_the_item_paths_answer_405(
+    client: TestClient, method: str, url: str, allow: str
+) -> None:
+    response = getattr(client, method)(url)
+
+    assert_error(response, 405, "METHOD_NOT_ALLOWED")
+    assert response.headers["allow"] == allow
+
+
+def test_patch_returns_the_updated_competency_without_the_owner(
+    client: TestClient, service: FakeService
+) -> None:
+    service.changed = record(name="Git")
+
+    response = patch_item(client)
+
+    assert response.status_code == 200
+    assert set(response.json()) == RESPONSE_FIELDS
+    assert response.json()["name"] == "Git"
+    assert str(USER.id) not in response.text
+
+
+def test_patch_passes_the_user_the_id_and_only_the_sent_fields(
+    client: TestClient, service: FakeService
+) -> None:
+    client.patch(ITEM_URL, json={"importance": "low", "description": None})
+
+    ((name, pool, user, competency_id, data),) = service.calls
+    assert (name, pool, user, competency_id) == ("update", POOL, USER, COMPETENCY_ID)
+    assert data.changes() == {"importance": "low", "description": None}
+
+
+def test_archive_returns_the_archived_competency(client: TestClient, service: FakeService) -> None:
+    service.changed = record(status="archived")
+
+    response = archive_item(client)
+
+    assert response.status_code == 200
+    assert set(response.json()) == RESPONSE_FIELDS
+    assert response.json()["status"] == "archived"
+    assert service.calls == [("archive", POOL, USER, COMPETENCY_ID, None)]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"name": None},
+        {"name": " "},
+        {"display_order": None},
+        {"display_order": "1"},
+        {"status": "archived"},
+        {"career_goal_id": str(GOAL_ID)},
+        {"name": "Git", "user_id": str(USER.id)},
+        {"importance": "urgent"},
+        [],
+        None,
+    ],
+)
+def test_an_invalid_patch_is_422_and_does_not_reach_the_service(
+    client: TestClient, service: FakeService, body: Any
+) -> None:
+    response = client.patch(ITEM_URL, json=body)
+
+    error = assert_error(response, 422, "VALIDATION_ERROR")
+    assert error["details"]
+    assert service.calls == []
+
+
+@pytest.mark.parametrize(
+    ("method", "url", "body"),
+    [
+        ("patch", "/api/v1/competencies/not-a-uuid", {"name": "Git"}),
+        ("post", "/api/v1/competencies/not-a-uuid/archive", None),
+    ],
+)
+def test_a_malformed_competency_id_is_422(
+    client: TestClient, service: FakeService, method: str, url: str, body: Any
+) -> None:
+    response = client.request(method.upper(), url, json=body)
+
+    error = assert_error(response, 422, "VALIDATION_ERROR")
+    assert "competency_id" in {d["field"] for d in error["details"]}
+    assert service.calls == []
+
+
+@ITEM_CALLS
+@pytest.mark.parametrize(
+    ("raised", "status", "code"),
+    [
+        (CompetencyNotFoundError(), 404, "COMPETENCY_NOT_FOUND"),
+        (CompetencyArchivedError(), 409, "COMPETENCY_ARCHIVED"),
+        (GoalArchivedError(), 409, "GOAL_ARCHIVED"),
+        (CompetencyNameExistsError(), 409, "COMPETENCY_NAME_EXISTS"),
+        (DatabaseUnavailableError("database unavailable"), 503, "SERVICE_UNAVAILABLE"),
+        (pg_errors.QueryCanceled("statement timeout"), 504, "DATABASE_TIMEOUT"),
+    ],
+)
+def test_service_errors_of_the_item_endpoints_become_api_errors(
+    client: TestClient,
+    service: FakeService,
+    call: Any,
+    raised: BaseException,
+    status: int,
+    code: str,
+) -> None:
+    service.changed = raised
+
+    assert_error(call(client), status, code)
+
+
+@ITEM_CALLS
+def test_the_item_endpoints_require_a_token(service: FakeService, call: Any) -> None:
+    # No dependency overrides: the real authentication dependency rejects the request.
+    response = call(TestClient(main.app, raise_server_exceptions=False))
+
+    assert_error(response, 401, "UNAUTHORIZED")
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert service.calls == []

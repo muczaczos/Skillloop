@@ -6,8 +6,10 @@ from app.core import errors
 from app.core.errors import (
     ActiveGoalExistsError,
     AppError,
+    CompetencyArchivedError,
     CompetencyLimitReachedError,
     CompetencyNameExistsError,
+    CompetencyNotFoundError,
     GoalArchivedError,
     GoalNotFoundError,
     NoActiveGoalError,
@@ -23,6 +25,8 @@ from app.core.errors import (
         (NoActiveGoalError, 404, "NO_ACTIVE_GOAL"),
         (ActiveGoalExistsError, 409, "ACTIVE_GOAL_EXISTS"),
         (GoalArchivedError, 409, "GOAL_ARCHIVED"),
+        (CompetencyNotFoundError, 404, "COMPETENCY_NOT_FOUND"),
+        (CompetencyArchivedError, 409, "COMPETENCY_ARCHIVED"),
         (CompetencyLimitReachedError, 409, "COMPETENCY_LIMIT_REACHED"),
         (CompetencyNameExistsError, 409, "COMPETENCY_NAME_EXISTS"),
     ],
@@ -44,7 +48,7 @@ def test_codes_are_unique() -> None:
     subclasses = AppError.__subclasses__()
     codes = [cls.code for cls in subclasses]
 
-    assert len(codes) == len(set(codes)) == 7
+    assert len(codes) == len(set(codes)) == 9
 
 
 def test_errors_module_does_not_depend_on_fastapi() -> None:

@@ -11,7 +11,7 @@ from uuid import UUID
 import pytest
 from psycopg import sql
 
-from app.repositories import _sql, career_goals, profiles
+from app.repositories import _sql, career_goals, competencies, profiles
 
 USER_ID = UUID("11111111-1111-1111-1111-111111111111")
 GOAL_ID = UUID("22222222-2222-2222-2222-222222222222")
@@ -74,6 +74,16 @@ def test_allow_lists_match_the_column_grants_of_the_migrations() -> None:
     assert profiles.UPDATABLE_COLUMNS == ("display_name", "preferred_language")
     # `status` is deliberately absent: a goal is archived only through archive_active().
     assert career_goals.UPDATABLE_COLUMNS == ("target_role", "seniority", "description")
+    assert competencies.UPDATABLE_COLUMNS == (
+        "name",
+        "description",
+        "rationale",
+        "category",
+        "knowledge_type",
+        "importance",
+        "expected_level",
+        "display_order",
+    )
 
 
 # --- the SQL that is sent --------------------------------------------------------------------

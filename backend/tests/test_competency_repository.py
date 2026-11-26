@@ -404,3 +404,99 @@ def test_the_repository_only_asks_the_connection_for_a_cursor(
 ) -> None:
     # FakeConnection raises AssertionError on transaction(), commit(), rollback(), close() ...
     call(FakeConnection([row()]))
+
+
+# --- get_by_id, update_active, archive_active ---------------------------------------------------
+
+COMPETENCY_ID = UUID("33333333-3333-3333-3333-333333333333")
+
+
+def get_one(conn: FakeConnection) -> CompetencyRecord | None:
+    return competencies.get_by_id(conn, USER_ID, COMPETENCY_ID)  # type: ignore[arg-type]
+
+
+def update(conn: FakeConnection, **changes: Any) -> CompetencyRecord | None:
+    return competencies.update_active(
+        conn,
+        USER_ID,
+        COMPETENCY_ID,
+        changes or {"name": "Git"},  # type: ignore[arg-type]
+    )
+
+
+def archive(conn: FakeConnection) -> CompetencyRecord | None:
+    return competencies.archive_active(conn, USER_ID, COMPETENCY_ID)  # type: ignore[arg-type]
+
+
+def test_get_by_id_is_scoped_to_the_owner_and_returns_any_status() -> None:
+    conn = FakeConnection([row(status="archived")])
+
+    record = get_one(conn)
+
+    assert record is not None and record.status == "archived"
+    ((statement, params),) = conn.statements
+    assert statement == (
+        f"SELECT {', '.join(FIELDS)} FROM public.competencies WHERE id = %s AND user_id = %s"
+    )
+    assert params == [COMPETENCY_ID, USER_ID]
+
+
+def test_update_sets_only_the_given_columns_of_an_active_competency_of_the_user() -> None:
+    conn = FakeConnection([row(name="Git", category=None)])
+
+    record = update(conn, name="Git", category=None)
+
+    assert record is not None and record.name == "Git"
+    ((statement, params),) = conn.statements
+    assert statement == (
+        'UPDATE public.competencies SET "name" = %s, "category" = %s '
+        f"WHERE id = %s AND user_id = %s AND status = 'active' RETURNING {', '.join(FIELDS)}"
+    )
+    assert params == ["Git", None, COMPETENCY_ID, USER_ID]
+
+
+@pytest.mark.parametrize(
+    "column", ["status", "id", "user_id", "career_goal_id", "created_at", "updated_at"]
+)
+def test_update_refuses_a_column_that_is_not_updatable(column: str) -> None:
+    conn = FakeConnection([row()])
+
+    with pytest.raises(ValueError, match="cannot be updated"):
+        update(conn, **{column: "x"})
+
+    assert conn.statements == []
+
+
+def test_archive_only_sets_the_status_of_an_active_competency_of_the_user() -> None:
+    conn = FakeConnection([row(status="archived")])
+
+    record = archive(conn)
+
+    assert record is not None and record.status == "archived"
+    ((statement, params),) = conn.statements
+    assert statement == (
+        "UPDATE public.competencies SET status = 'archived' "
+        f"WHERE id = %s AND user_id = %s AND status = 'active' RETURNING {', '.join(FIELDS)}"
+    )
+    assert params == [COMPETENCY_ID, USER_ID]
+
+
+@pytest.mark.parametrize("call", [get_one, update, archive], ids=["get", "update", "archive"])
+def test_no_matching_row_gives_none_after_one_statement(
+    call: Callable[[FakeConnection], Any],
+) -> None:
+    conn = FakeConnection([])
+
+    assert call(conn) is None
+    assert len(conn.statements) == 1
+
+
+@pytest.mark.parametrize("call", [get_one, update, archive], ids=["get", "update", "archive"])
+def test_database_errors_of_the_item_statements_are_not_caught(
+    call: Callable[[FakeConnection], Any],
+) -> None:
+    conn = FakeConnection([row()])
+    conn.error = errors.CheckViolation("refused")
+
+    with pytest.raises(errors.CheckViolation):
+        call(conn)

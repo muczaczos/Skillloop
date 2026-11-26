@@ -68,7 +68,7 @@ OPENAPI_TAGS = [
     },
     {
         "name": "competencies",
-        "description": "The competencies of a career goal: listed and added manually.",
+        "description": "The competencies of a career goal: listed, added, edited and archived manually.",
     },
 ]
 
@@ -95,3 +95,4 @@ app.include_router(health.router, prefix=API_PREFIX)
 app.include_router(profile.router, prefix=API_PREFIX)
 app.include_router(career_goals.router, prefix=API_PREFIX)
 app.include_router(competencies.router, prefix=API_PREFIX)
+app.include_router(competencies.item_router, prefix=API_PREFIX)

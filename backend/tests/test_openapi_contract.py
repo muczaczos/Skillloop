@@ -26,7 +26,9 @@ from app.api.deps import get_current_user, get_db_pool
 from app.core.errors import (
     ActiveGoalExistsError,
     AppError,
+    CompetencyArchivedError,
     CompetencyNameExistsError,
+    CompetencyNotFoundError,
     GoalArchivedError,
     GoalNotFoundError,
     NoActiveGoalError,
@@ -35,7 +37,7 @@ from app.core.errors import (
 from app.db.errors import DatabaseUnavailableError
 from app.models.auth import AuthenticatedUser
 from app.schemas.career_goal import CareerGoalCreate, CareerGoalResponse, CareerGoalUpdate
-from app.schemas.competency import CompetencyCreate, CompetencyResponse
+from app.schemas.competency import CompetencyCreate, CompetencyResponse, CompetencyUpdate
 from app.schemas.errors import ErrorResponse, ValidationErrorResponse
 from app.schemas.profile import ProfileResponse, ProfileUpdate
 
@@ -48,6 +50,8 @@ ACTIVE = f"{GOALS}/active"
 ITEM = f"{GOALS}/{{goal_id}}"
 ARCHIVE = f"{GOALS}/{{goal_id}}/archive"
 COMPETENCIES = f"{GOALS}/{{goal_id}}/competencies"
+COMPETENCY = "/api/v1/competencies/{competency_id}"
+COMPETENCY_ARCHIVE = f"{COMPETENCY}/archive"
 HEALTH = "/api/v1/health"
 
 # (method, path) -> status -> the domain error codes documented for it (None: no domain code).
@@ -81,6 +85,20 @@ EXPECTED: dict[tuple[str, str], dict[str, set[str] | None]] = {
         "201": None,
         "404": {"GOAL_NOT_FOUND"},
         "409": {"GOAL_ARCHIVED", "COMPETENCY_NAME_EXISTS", "COMPETENCY_LIMIT_REACHED"},
+        "422": None,
+        **INFRA,
+    },
+    ("patch", COMPETENCY): {
+        "200": None,
+        "404": {"COMPETENCY_NOT_FOUND"},
+        "409": {"COMPETENCY_ARCHIVED", "GOAL_ARCHIVED", "COMPETENCY_NAME_EXISTS"},
+        "422": None,
+        **INFRA,
+    },
+    ("post", COMPETENCY_ARCHIVE): {
+        "200": None,
+        "404": {"COMPETENCY_NOT_FOUND"},
+        "409": {"COMPETENCY_ARCHIVED", "GOAL_ARCHIVED"},
         "422": None,
         **INFRA,
     },
@@ -168,6 +186,8 @@ def test_only_the_career_goal_401_mentions_a_user_that_no_longer_exists() -> Non
     assert "no longer exists" not in description(COMPETENCIES, "get")
     # A deleted user with a valid token gets 404 GOAL_NOT_FOUND (the goal is not visible).
     assert "no longer exists" not in description(COMPETENCIES, "post")
+    assert "no longer exists" not in description(COMPETENCY, "patch")
+    assert "no longer exists" not in description(COMPETENCY_ARCHIVE, "post")
     for method, path in (("post", GOALS), ("get", ACTIVE), ("patch", ITEM), ("post", ARCHIVE)):
         assert "no longer exists" in description(path, method)
 
@@ -194,6 +214,8 @@ def test_operation_ids_are_unchanged_and_unique() -> None:
             "archive_career_goal_api_v1_career_goals__goal_id__archive_post",
             "list_competencies_api_v1_career_goals__goal_id__competencies_get",
             "create_competency_api_v1_career_goals__goal_id__competencies_post",
+            "update_competency_api_v1_competencies__competency_id__patch",
+            "archive_competency_api_v1_competencies__competency_id__archive_post",
         ]
     )
 
@@ -252,6 +274,7 @@ def test_every_example_in_the_document_validates_against_its_model() -> None:
         CareerGoalResponse,
         CompetencyCreate,
         CompetencyResponse,
+        CompetencyUpdate,
         ProfileUpdate,
         ProfileResponse,
     ):
@@ -285,7 +308,10 @@ def failing(monkeypatch: pytest.MonkeyPatch) -> Raises:
             goals_api.career_goal_service,
             ("create_goal", "get_active_goal", "update_goal", "archive_goal"),
         ),
-        (competencies_api.competency_service, ("list_competencies", "create_competency")),
+        (
+            competencies_api.competency_service,
+            ("list_competencies", "create_competency", "update_competency", "archive_competency"),
+        ),
     ):
         for name in names:
             monkeypatch.setattr(module, name, raises)
@@ -320,6 +346,8 @@ REQUESTS: dict[tuple[str, str], tuple[str, dict[str, Any] | None]] = {
             "expected_level": "intermediate",
         },
     ),
+    ("patch", COMPETENCY): (f"/api/v1/competencies/{GOAL_ID}", {"name": "Git"}),
+    ("post", COMPETENCY_ARCHIVE): (f"/api/v1/competencies/{GOAL_ID}/archive", None),
 }
 
 # Status -> (exception the service raises, the code the documented response promises).
@@ -339,6 +367,10 @@ DOMAIN = {
     ("get", COMPETENCIES, "404"): GoalNotFoundError(),
     ("post", COMPETENCIES, "404"): GoalNotFoundError(),
     ("post", COMPETENCIES, "409"): CompetencyNameExistsError(),
+    ("patch", COMPETENCY, "404"): CompetencyNotFoundError(),
+    ("patch", COMPETENCY, "409"): CompetencyArchivedError(),
+    ("post", COMPETENCY_ARCHIVE, "404"): CompetencyNotFoundError(),
+    ("post", COMPETENCY_ARCHIVE, "409"): CompetencyArchivedError(),
 }
 
 
@@ -386,6 +418,8 @@ def test_real_domain_errors_match_the_documented_ones(
         ("post", f"{GOALS}/not-a-uuid/archive", None),
         ("post", f"{GOALS}/{GOAL_ID}/competencies", {"name": "Docker"}),
         ("get", f"{GOALS}/not-a-uuid/competencies", None),
+        ("patch", f"/api/v1/competencies/{GOAL_ID}", {}),
+        ("post", "/api/v1/competencies/not-a-uuid/archive", None),
     ],
 )
 def test_real_422_matches_the_validation_error_model(

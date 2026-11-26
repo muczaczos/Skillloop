@@ -19,8 +19,10 @@ from psycopg import errors
 
 from app.core.errors import (
     AppError,
+    CompetencyArchivedError,
     CompetencyLimitReachedError,
     CompetencyNameExistsError,
+    CompetencyNotFoundError,
     GoalArchivedError,
     GoalNotFoundError,
 )
@@ -29,7 +31,7 @@ from app.db.errors import DatabaseUnavailableError
 from app.models.auth import AuthenticatedUser
 from app.models.career_goal import CareerGoalRecord
 from app.models.competency import CompetencyRecord
-from app.schemas.competency import CompetencyCreate
+from app.schemas.competency import CompetencyCreate, CompetencyUpdate
 from app.services import competency_service
 from tests.db_fakes import FakeUserConnection, FakeUserPool
 from tests.test_competency_schemas import make_record
@@ -92,7 +94,13 @@ class Repos:
         self.competencies = MagicMock()
         self.career_goals = MagicMock()
         for module in (self.competencies, self.career_goals):
-            for name in ("insert", "list_by_goal", "get_by_id"):
+            for name in (
+                "insert",
+                "list_by_goal",
+                "get_by_id",
+                "update_active",
+                "archive_active",
+            ):
                 getattr(module, name).side_effect = self._unexpected(name)
 
     def _unexpected(self, name: str) -> Callable[..., Any]:
@@ -487,3 +495,205 @@ def test_the_service_does_not_depend_on_fastapi_or_http() -> None:
 
     for forbidden in ("fastapi", "starlette", "HTTPException", "status_code"):
         assert forbidden not in source
+
+
+# --- update_competency and archive_competency ---------------------------------------------------
+
+COMPETENCY_ID = UUID("33333333-3333-3333-3333-333333333333")
+PATCH = CompetencyUpdate(name="Kubernetes", category=None)
+
+
+def update(pool: FakeUserPool) -> CompetencyRecord:
+    return competency_service.update_competency(pool, USER, COMPETENCY_ID, PATCH)  # type: ignore[arg-type]
+
+
+def archive(pool: FakeUserPool) -> CompetencyRecord:
+    return competency_service.archive_competency(pool, USER, COMPETENCY_ID)  # type: ignore[arg-type]
+
+
+CHANGES = pytest.mark.parametrize(
+    ("call", "statement"),
+    [(update, "update_active"), (archive, "archive_active")],
+    ids=["update", "archive"],
+)
+
+
+@CHANGES
+def test_a_change_that_applies_uses_one_transaction_and_reads_nothing(
+    pool: FakeUserPool, repos: Repos, call: Callable[..., Any], statement: str
+) -> None:
+    record = make_record()
+    repos.script(repos.competencies, statement, record)
+
+    assert call(pool) is record
+
+    assert pool.events == [*START, f"repo.{statement}", "COMMIT", "pool.release"]
+    repos.competencies.get_by_id.assert_not_called()
+    repos.career_goals.get_by_id.assert_not_called()
+
+
+def test_update_sends_exactly_the_fields_of_the_request(pool: FakeUserPool, repos: Repos) -> None:
+    repos.script(repos.competencies, "update_active", make_record())
+
+    update(pool)
+
+    repos.competencies.update_active.assert_called_once_with(
+        pool.conn, USER.id, COMPETENCY_ID, {"name": "Kubernetes", "category": None}
+    )
+
+
+def test_archive_takes_the_owner_from_the_token(pool: FakeUserPool, repos: Repos) -> None:
+    repos.script(repos.competencies, "archive_active", make_record(status="archived"))
+
+    archive(pool)
+
+    repos.competencies.archive_active.assert_called_once_with(pool.conn, USER.id, COMPETENCY_ID)
+
+
+REASONS = pytest.mark.parametrize(
+    ("competency_status", "goal_status", "expected"),
+    [
+        (None, None, CompetencyNotFoundError),
+        ("archived", "active", CompetencyArchivedError),
+        ("archived", "archived", CompetencyArchivedError),  # the resource before its parent
+        ("active", "archived", GoalArchivedError),
+    ],
+    ids=["missing", "archived", "both-archived", "goal-archived"],
+)
+
+
+def script_state(repos: Repos, competency_status: str | None, goal_status: str | None) -> None:
+    found = None if competency_status is None else make_record(status=competency_status)
+    repos.script(repos.competencies, "get_by_id", found)
+    if competency_status == "active":
+        repos.script(repos.career_goals, "get_by_id", goal(goal_status or "active"))
+
+
+@CHANGES
+@REASONS
+def test_a_change_that_matches_no_row_is_explained(
+    pool: FakeUserPool,
+    repos: Repos,
+    call: Callable[..., Any],
+    statement: str,
+    competency_status: str | None,
+    goal_status: str | None,
+    expected: type[AppError],
+) -> None:
+    repos.script(repos.competencies, statement, None)
+    script_state(repos, competency_status, goal_status)
+
+    with pytest.raises(expected):
+        call(pool)
+
+    assert pool.events.count("pool.acquire") == 1
+    assert "ROLLBACK" in pool.events and "COMMIT" not in pool.events
+
+
+@CHANGES
+@pytest.mark.parametrize("found_goal", [goal("active"), None], ids=["active-goal", "no-goal"])
+def test_an_unexplained_unchanged_row_is_a_bug_and_not_a_client_error(
+    pool: FakeUserPool,
+    repos: Repos,
+    call: Callable[..., Any],
+    statement: str,
+    found_goal: CareerGoalRecord | None,
+) -> None:
+    repos.script(repos.competencies, statement, None)
+    repos.script(repos.competencies, "get_by_id", make_record())
+    repos.script(repos.career_goals, "get_by_id", found_goal)
+
+    with pytest.raises(RuntimeError, match="was not changed"):
+        call(pool)
+
+
+@CHANGES
+@REASONS
+def test_a_trigger_refusal_is_explained_in_a_new_transaction(
+    pool: FakeUserPool,
+    repos: Repos,
+    call: Callable[..., Any],
+    statement: str,
+    competency_status: str | None,
+    goal_status: str | None,
+    expected: type[AppError],
+) -> None:
+    refusal = violation(errors.CheckViolation, "competencies_goal_not_active")
+    repos.script(repos.competencies, statement, refusal)
+    script_state(repos, competency_status, goal_status)
+
+    with pytest.raises(expected):
+        call(pool)
+
+    assert pool.events.count("pool.acquire") == 2
+    # the failed transaction is rolled back and released before anything is read
+    first_release = pool.events.index("pool.release")
+    assert pool.events.index("ROLLBACK") < first_release
+    assert first_release < pool.events.index("repo.get_by_id")
+
+
+@pytest.mark.parametrize("constraint", ["competencies_name_check", None])
+@CHANGES
+def test_another_check_violation_of_a_change_is_not_translated(
+    pool: FakeUserPool,
+    repos: Repos,
+    call: Callable[..., Any],
+    statement: str,
+    constraint: str | None,
+) -> None:
+    refusal = violation(errors.CheckViolation, constraint)
+    repos.script(repos.competencies, statement, refusal)
+
+    with pytest.raises(errors.CheckViolation) as exc_info:
+        call(pool)
+
+    assert exc_info.value is refusal
+
+
+def test_a_rename_to_a_taken_name_is_a_name_conflict(pool: FakeUserPool, repos: Repos) -> None:
+    taken = violation(errors.UniqueViolation, "competencies_active_name_unique")
+    repos.script(repos.competencies, "update_active", taken)
+
+    with pytest.raises(CompetencyNameExistsError):
+        update(pool)
+
+    assert pool.events.count("pool.acquire") == 1
+
+
+def test_another_unique_violation_of_an_update_is_not_translated(
+    pool: FakeUserPool, repos: Repos
+) -> None:
+    other = violation(errors.UniqueViolation, "competencies_pkey")
+    repos.script(repos.competencies, "update_active", other)
+
+    with pytest.raises(errors.UniqueViolation):
+        update(pool)
+
+
+@CHANGES
+@pytest.mark.parametrize("failure", [deadlock, serialization], ids=["deadlock", "serialization"])
+def test_a_change_is_retried_as_a_whole_transaction(
+    pool: FakeUserPool,
+    repos: Repos,
+    call: Callable[..., Any],
+    statement: str,
+    failure: Callable[[], BaseException],
+) -> None:
+    record = make_record()
+    repos.script(repos.competencies, statement, failure(), record)
+
+    assert call(pool) is record
+    assert pool.events.count("pool.acquire") == 2
+    assert pool.events.count("COMMIT") == 1
+
+
+@CHANGES
+def test_a_change_that_keeps_failing_is_reported_as_unavailable(
+    pool: FakeUserPool, repos: Repos, call: Callable[..., Any], statement: str
+) -> None:
+    repos.script(repos.competencies, statement, deadlock())
+
+    with pytest.raises(DatabaseUnavailableError):
+        call(pool)
+
+    assert pool.events.count("pool.acquire") == session.RETRY_MAX_ATTEMPTS

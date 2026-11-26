@@ -111,8 +111,8 @@ FastAPI does not implement its own password management or token generation.
 |Competencies|GET|`/career-goals/{id}/competencies`|List competencies (implemented, Stage 9.2)|
 |Competencies|POST|`/career-goals/{id}/competencies/generate`|Generate competency map (deferred: AI stage, not in Stage 9)|
 |Competencies|POST|`/career-goals/{id}/competencies`|Add competency (implemented, Stage 9.2)|
-|Competencies|PATCH|`/competencies/{id}`|Update competency (planned, Stage 9.3)|
-|Competencies|POST|`/competencies/{id}/archive`|Archive competency (planned, Stage 9.3)|
+|Competencies|PATCH|`/competencies/{id}`|Update competency (implemented, Stage 9.3)|
+|Competencies|POST|`/competencies/{id}/archive`|Archive competency (implemented, Stage 9.3)|
 |Assessment|POST|`/assessments/diagnostic`|Start initial diagnostic|
 |Assessment|POST|`/assessments/{id}/items`|Generate next diagnostic question|
 |Assessment|GET|`/assessments/{id}`|Get assessment state|
@@ -132,7 +132,7 @@ FastAPI does not implement its own password management or token generation.
 
 This is the proposed MVP endpoint set. Some endpoints may be combined or simplified during implementation if that does not weaken the API contract.
 
-Competency endpoints: `GET` and `POST` are implemented (Stage 9.2), `PATCH` and `archive` are planned for Stage 9.3, and `generate` is deferred to the AI stage. Details are in section 7.
+Competency endpoints: `GET` and `POST` (Stage 9.2), `PATCH` and `archive` (Stage 9.3) are implemented, and `generate` is deferred to the AI stage. Details are in section 7.
 
 ## 5. Profile API
 
@@ -246,17 +246,17 @@ Errors: `401`, `404 GOAL_NOT_FOUND`, `409 GOAL_ARCHIVED`, `422` (invalid id), `5
 
 ## 7. Competency API
 
-**Status: partly implemented.** The contract below was approved in Stage 9.0. Stage 9 delivers the **manual** competency map only.
+**Status: manual map implemented, AI generation deferred.** The contract below was approved in Stage 9.0. Stage 9 delivers the **manual** competency map only.
 
 |Endpoint|Status|
 |---|---|
 |`GET /career-goals/{goal_id}/competencies`|**Implemented** (Stage 9.2)|
 |`POST /career-goals/{goal_id}/competencies`|**Implemented** (Stage 9.2)|
-|`PATCH /competencies/{competency_id}`|Planned (Stage 9.3), not available yet|
-|`POST /competencies/{competency_id}/archive`|Planned (Stage 9.3), not available yet|
+|`PATCH /competencies/{competency_id}`|**Implemented** (Stage 9.3)|
+|`POST /competencies/{competency_id}/archive`|**Implemented** (Stage 9.3)|
 |`POST /career-goals/{goal_id}/competencies/generate` and saving a whole map|Deferred to the AI stage|
 
-The two implemented endpoints are in `backend/app/api/competencies.py`; the rules are applied by `competency_service` and the database. The data model, the rules and the database behaviour in special situations are in `DATABASE-DESIGN.md` (sections 4.3, 4.3.1 and 4.8).
+The four implemented endpoints are in `backend/app/api/competencies.py`; the rules are applied by `competency_service` and the database. The data model, the rules and the database behaviour in special situations are in `DATABASE-DESIGN.md` (sections 4.3, 4.3.1 and 4.8).
 
 Conventions are those of section 6: identifiers come from the path, the user from the verified token; the request models reject unknown fields (`user_id`, `career_goal_id`, `status`, `id`); a resource of another user is indistinguishable from a missing one (`404`).
 
@@ -329,15 +329,26 @@ Rules:
 
 Errors: `401`, `404 GOAL_NOT_FOUND`, `409 GOAL_ARCHIVED`, `409 COMPETENCY_NAME_EXISTS`, `409 COMPETENCY_LIMIT_REACHED`, `422`, `503`, `504`.
 
-### PATCH `/competencies/{competency_id}` (planned, Stage 9.3: not implemented yet)
+### PATCH `/competencies/{competency_id}` (implemented, Stage 9.3)
 
 Updates one **active** competency in an **active** goal. Fields that are left out are not changed; at least one field is required. `description`, `rationale` and `category` may be `null` to clear them; `name`, `knowledge_type`, `importance`, `expected_level` and `display_order` may not be `null`. `status`, `career_goal_id` and `user_id` cannot be sent: a competency is archived only through the archive endpoint and never moves to another goal.
+
+Request (any subset of the fields of `POST`):
+
+```
+{
+  "importance": "critical",
+  "category": null
+}
+```
+
+Values follow the same rules as in `POST`; blank text in `description`, `rationale` or `category` also clears the field.
 
 Response `200`: the updated competency.
 
 Errors: `401`, `404 COMPETENCY_NOT_FOUND`, `409 COMPETENCY_ARCHIVED`, `409 GOAL_ARCHIVED`, `409 COMPETENCY_NAME_EXISTS`, `422`, `503`, `504`.
 
-### POST `/competencies/{competency_id}/archive` (planned, Stage 9.3: not implemented yet)
+### POST `/competencies/{competency_id}/archive` (implemented, Stage 9.3)
 
 Archives one active competency and returns it (`200`, status `archived`). Archiving is one-way: an archived competency is immutable and never becomes active again. Its historical assessment data is never deleted. Archiving frees one of the 50 slots and releases the name.
 
@@ -764,7 +775,7 @@ Error codes of the competency endpoints. `COMPETENCY_NAME_EXISTS` and `COMPETENC
 |409|`COMPETENCY_NAME_EXISTS`|An active competency with this name (ignoring case) already exists in the goal.|
 |409|`COMPETENCY_LIMIT_REACHED`|The goal already has 50 active competencies.|
 
-Planned for Stage 9.3 (not in use yet):
+In use since Stage 9.3 (`PATCH /competencies/{competency_id}` and `POST /competencies/{competency_id}/archive`):
 
 |Status|Code|When|
 |---|---|---|

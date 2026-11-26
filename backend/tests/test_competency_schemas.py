@@ -25,6 +25,7 @@ from app.schemas.competency import (
     CompetencyCreate,
     CompetencyListResponse,
     CompetencyResponse,
+    CompetencyUpdate,
 )
 from tests.test_schemas import _migration, _normalized, errors_of
 
@@ -375,3 +376,91 @@ def test_the_record_has_exactly_the_columns_of_the_table() -> None:
     columns = {part.split()[0] for part in table.split(",") if part.strip()}
 
     assert columns == set(CompetencyRecord.model_fields)
+
+
+# --- CompetencyUpdate (PATCH) ------------------------------------------------------------------
+
+NOT_NULLABLE = ["name", "knowledge_type", "importance", "expected_level", "display_order"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("name", "Kubernetes"),
+        ("description", "Orchestration."),
+        ("rationale", "Common."),
+        ("category", "Containers"),
+        ("knowledge_type", "memory"),
+        ("importance", "low"),
+        ("expected_level", "advanced"),
+        ("display_order", 0),
+    ],
+)
+def test_update_changes_contain_only_the_field_that_was_sent(field: str, value: Any) -> None:
+    assert CompetencyUpdate.model_validate({field: value}).changes() == {field: value}
+
+
+@pytest.mark.parametrize("field", TEXT_FIELDS)
+@pytest.mark.parametrize("value", [None, "", "  \n "], ids=["null", "empty", "blank"])
+def test_update_clears_an_optional_text_with_null_or_blank(field: str, value: Any) -> None:
+    assert CompetencyUpdate.model_validate({field: value}).changes() == {field: None}
+
+
+@pytest.mark.parametrize("field", NOT_NULLABLE)
+def test_update_rejects_null_for_a_required_column(field: str) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        CompetencyUpdate.model_validate({field: None})
+
+    assert errors_of(exc_info)[0][0] == (field,)
+
+
+def test_update_requires_at_least_one_field() -> None:
+    with pytest.raises(ValidationError, match="at least one field"):
+        CompetencyUpdate.model_validate({})
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["id", "career_goal_id", "user_id", "status", "created_at", "updated_at", "unknown"],
+)
+def test_update_rejects_fields_the_client_may_not_send(field: str) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        CompetencyUpdate.model_validate({"name": "Git", field: "x"})
+
+    assert errors_of(exc_info)[0][0] == (field,)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("name", "   "),
+        ("name", "x" * (COMPETENCY_NAME_MAX_LENGTH + 1)),
+        ("name", "a\x00b"),
+        ("description", "d" * (COMPETENCY_TEXT_MAX_LENGTH + 1)),
+        ("rationale", "r" * (COMPETENCY_TEXT_MAX_LENGTH + 1)),
+        ("category", "c" * (COMPETENCY_CATEGORY_MAX_LENGTH + 1)),
+        ("knowledge_type", "magic"),
+        ("importance", "urgent"),
+        ("expected_level", "not_assessed"),
+        ("display_order", -1),
+        ("display_order", DISPLAY_ORDER_MAX + 1),
+        ("display_order", "5"),
+        ("display_order", 5.0),
+        ("display_order", True),
+    ],
+)
+def test_update_applies_the_same_value_rules_as_create(field: str, value: Any) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        CompetencyUpdate.model_validate({field: value})
+
+    assert errors_of(exc_info)[0][0][0] == field
+
+
+def test_update_strips_surrounding_whitespace() -> None:
+    update = CompetencyUpdate.model_validate({"name": "  Git \n", "category": " VCS "})
+
+    assert update.changes() == {"name": "Git", "category": "VCS"}
+
+
+def test_update_offers_the_same_fields_as_create() -> None:
+    assert list(CompetencyUpdate.model_fields) == list(CompetencyCreate.model_fields)

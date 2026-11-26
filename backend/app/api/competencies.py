@@ -1,14 +1,17 @@
 """Competency endpoints (docs/API-DESIGN.md, section 7).
 
-GET and POST /career-goals/{goal_id}/competencies.
+GET and POST /career-goals/{goal_id}/competencies (`router`), PATCH
+/competencies/{competency_id} and POST /competencies/{competency_id}/archive
+(`item_router`).
 
-Both endpoints are plain `def` functions on purpose: the service uses blocking database access,
+All endpoints are plain `def` functions on purpose: the service uses blocking database access,
 so FastAPI runs them in its thread pool instead of on the event loop.
 
 The router only connects HTTP to the service: it validates the request, passes the user from the
 verified token, and shapes the response. Every rule (ownership, the 50-active limit, unique active
-names, archived goals) lives in the service and the database. Their errors (GOAL_NOT_FOUND,
-GOAL_ARCHIVED, COMPETENCY_LIMIT_REACHED, COMPETENCY_NAME_EXISTS) are raised as AppError and turned
+names, archived goals and competencies) lives in the service and the database. Their
+errors (GOAL_NOT_FOUND, GOAL_ARCHIVED, COMPETENCY_NOT_FOUND, COMPETENCY_ARCHIVED,
+COMPETENCY_LIMIT_REACHED, COMPETENCY_NAME_EXISTS) are raised as AppError and turned
 into the unified error response by the central handlers, so nothing is mapped here.
 """
 
@@ -26,16 +29,28 @@ from app.api.openapi import (
     protected_responses,
 )
 from app.core.errors import (
+    CompetencyArchivedError,
     CompetencyLimitReachedError,
     CompetencyNameExistsError,
+    CompetencyNotFoundError,
     GoalArchivedError,
     GoalNotFoundError,
 )
-from app.schemas.competency import CompetencyCreate, CompetencyListResponse, CompetencyResponse
+from app.schemas.competency import (
+    CompetencyCreate,
+    CompetencyListResponse,
+    CompetencyResponse,
+    CompetencyUpdate,
+)
 from app.services import competency_service
 
 router = APIRouter(
     prefix="/career-goals/{goal_id}/competencies",
+    tags=["competencies"],
+    responses=protected_responses(),
+)
+item_router = APIRouter(
+    prefix="/competencies/{competency_id}",
     tags=["competencies"],
     responses=protected_responses(),
 )
@@ -79,4 +94,45 @@ def create_competency(
     cannot get new competencies (409)."""
     return CompetencyResponse.model_validate(
         competency_service.create_competency(pool, user, goal_id, data)
+    )
+
+
+@item_router.patch(
+    "",
+    response_model=CompetencyResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Update an active competency of the authenticated user",
+    responses={
+        **not_found(CompetencyNotFoundError),
+        **conflict(CompetencyArchivedError, GoalArchivedError, CompetencyNameExistsError),
+        **VALIDATION_ERROR,
+    },
+)
+def update_competency(
+    competency_id: UUID, data: CompetencyUpdate, user: CurrentUser, pool: DbPool
+) -> CompetencyResponse:
+    """Fields that are left out are not changed; at least one field is required. `description`,
+    `rationale` and `category` may be set to null to clear them; the other fields may not be
+    null. An archived competency, or a competency of an archived goal, cannot be changed (409)."""
+    return CompetencyResponse.model_validate(
+        competency_service.update_competency(pool, user, competency_id, data)
+    )
+
+
+@item_router.post(
+    "/archive",
+    response_model=CompetencyResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Archive an active competency of the authenticated user",
+    responses={
+        **not_found(CompetencyNotFoundError),
+        **conflict(CompetencyArchivedError, GoalArchivedError),
+        **VALIDATION_ERROR,
+    },
+)
+def archive_competency(competency_id: UUID, user: CurrentUser, pool: DbPool) -> CompetencyResponse:
+    """Returns the archived competency. Archiving cannot be undone; it frees one of the 50 active
+    slots and releases the name. Archiving an archived competency is refused with 409."""
+    return CompetencyResponse.model_validate(
+        competency_service.archive_competency(pool, user, competency_id)
     )

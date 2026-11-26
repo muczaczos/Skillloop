@@ -1,0 +1,1361 @@
+diff --git a/backend/app/api/competencies.py b/backend/app/api/competencies.py
+index 7fe8dd3..ff0973b 100644
+--- a/backend/app/api/competencies.py
++++ b/backend/app/api/competencies.py
+@@ -1,14 +1,17 @@
+ """Competency endpoints (docs/API-DESIGN.md, section 7).
+ 
+-GET and POST /career-goals/{goal_id}/competencies.
++GET and POST /career-goals/{goal_id}/competencies (`router`), PATCH
++/competencies/{competency_id} and POST /competencies/{competency_id}/archive
++(`item_router`).
+ 
+-Both endpoints are plain `def` functions on purpose: the service uses blocking database access,
++All endpoints are plain `def` functions on purpose: the service uses blocking database access,
+ so FastAPI runs them in its thread pool instead of on the event loop.
+ 
+ The router only connects HTTP to the service: it validates the request, passes the user from the
+ verified token, and shapes the response. Every rule (ownership, the 50-active limit, unique active
+-names, archived goals) lives in the service and the database. Their errors (GOAL_NOT_FOUND,
+-GOAL_ARCHIVED, COMPETENCY_LIMIT_REACHED, COMPETENCY_NAME_EXISTS) are raised as AppError and turned
++names, archived goals and competencies) lives in the service and the database. Their
++errors (GOAL_NOT_FOUND, GOAL_ARCHIVED, COMPETENCY_NOT_FOUND, COMPETENCY_ARCHIVED,
++COMPETENCY_LIMIT_REACHED, COMPETENCY_NAME_EXISTS) are raised as AppError and turned
+ into the unified error response by the central handlers, so nothing is mapped here.
+ """
+ 
+@@ -26,12 +29,19 @@ from app.api.openapi import (
+     protected_responses,
+ )
+ from app.core.errors import (
++    CompetencyArchivedError,
+     CompetencyLimitReachedError,
+     CompetencyNameExistsError,
++    CompetencyNotFoundError,
+     GoalArchivedError,
+     GoalNotFoundError,
+ )
+-from app.schemas.competency import CompetencyCreate, CompetencyListResponse, CompetencyResponse
++from app.schemas.competency import (
++    CompetencyCreate,
++    CompetencyListResponse,
++    CompetencyResponse,
++    CompetencyUpdate,
++)
+ from app.services import competency_service
+ 
+ router = APIRouter(
+@@ -39,6 +49,11 @@ router = APIRouter(
+     tags=["competencies"],
+     responses=protected_responses(),
+ )
++item_router = APIRouter(
++    prefix="/competencies/{competency_id}",
++    tags=["competencies"],
++    responses=protected_responses(),
++)
+ 
+ DbPool = Annotated[ConnectionPool, Depends(get_db_pool)]
+ 
+@@ -80,3 +95,44 @@ def create_competency(
+     return CompetencyResponse.model_validate(
+         competency_service.create_competency(pool, user, goal_id, data)
+     )
++
++
++@item_router.patch(
++    "",
++    response_model=CompetencyResponse,
++    status_code=status.HTTP_200_OK,
++    summary="Update an active competency of the authenticated user",
++    responses={
++        **not_found(CompetencyNotFoundError),
++        **conflict(CompetencyArchivedError, GoalArchivedError, CompetencyNameExistsError),
++        **VALIDATION_ERROR,
++    },
++)
++def update_competency(
++    competency_id: UUID, data: CompetencyUpdate, user: CurrentUser, pool: DbPool
++) -> CompetencyResponse:
++    """Fields that are left out are not changed; at least one field is required. `description`,
++    `rationale` and `category` may be set to null to clear them; the other fields may not be
++    null. An archived competency, or a competency of an archived goal, cannot be changed (409)."""
++    return CompetencyResponse.model_validate(
++        competency_service.update_competency(pool, user, competency_id, data)
++    )
++
++
++@item_router.post(
++    "/archive",
++    response_model=CompetencyResponse,
++    status_code=status.HTTP_200_OK,
++    summary="Archive an active competency of the authenticated user",
++    responses={
++        **not_found(CompetencyNotFoundError),
++        **conflict(CompetencyArchivedError, GoalArchivedError),
++        **VALIDATION_ERROR,
++    },
++)
++def archive_competency(competency_id: UUID, user: CurrentUser, pool: DbPool) -> CompetencyResponse:
++    """Returns the archived competency. Archiving cannot be undone; it frees one of the 50 active
++    slots and releases the name. Archiving an archived competency is refused with 409."""
++    return CompetencyResponse.model_validate(
++        competency_service.archive_competency(pool, user, competency_id)
++    )
+diff --git a/backend/app/core/errors.py b/backend/app/core/errors.py
+index ed1a8e6..d13e694 100644
+--- a/backend/app/core/errors.py
++++ b/backend/app/core/errors.py
+@@ -56,6 +56,20 @@ class GoalArchivedError(AppError):
+     default_message = "The career goal is archived and can no longer be changed."
+ 
+ 
++class CompetencyNotFoundError(AppError):
++    status_code = 404
++    code = "COMPETENCY_NOT_FOUND"
++    default_message = "Competency not found."
++
++
++class CompetencyArchivedError(AppError):
++    """The competency exists but is archived, so it can no longer be changed."""
++
++    status_code = 409
++    code = "COMPETENCY_ARCHIVED"
++    default_message = "The competency is archived and can no longer be changed."
++
++
+ class CompetencyLimitReachedError(AppError):
+     """The goal already has the maximum number of active competencies (competencies_active_limit)."""
+ 
+diff --git a/backend/app/main.py b/backend/app/main.py
+index aaf3ff1..16e8d03 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -68,7 +68,7 @@ OPENAPI_TAGS = [
+     },
+     {
+         "name": "competencies",
+-        "description": "The competencies of a career goal: listed and added manually.",
++        "description": "The competencies of a career goal: listed, added, edited and archived manually.",
+     },
+ ]
+ 
+@@ -95,3 +95,4 @@ app.include_router(health.router, prefix=API_PREFIX)
+ app.include_router(profile.router, prefix=API_PREFIX)
+ app.include_router(career_goals.router, prefix=API_PREFIX)
+ app.include_router(competencies.router, prefix=API_PREFIX)
++app.include_router(competencies.item_router, prefix=API_PREFIX)
+diff --git a/backend/app/repositories/competencies.py b/backend/app/repositories/competencies.py
+index 43edfcd..8a267e8 100644
+--- a/backend/app/repositories/competencies.py
++++ b/backend/app/repositories/competencies.py
+@@ -9,14 +9,34 @@ goal is the caller's active goal and that it has fewer than 50 active competenci
+ trigger, SQLSTATE 23514, constraints competencies_goal_not_active and competencies_active_limit),
+ then the unique active name (23505, competencies_active_name_unique). Row Level Security restricts
+ every query to the competencies of the caller.
++
++An archived competency is immutable, and so is every competency of an archived goal. update_active()
++and archive_active() return None when they change nothing: the first rule is in their WHERE clause,
++the second in the UPDATE policy. If the goal is archived while the statement waits for the goal
++lock, the row trigger refuses instead (competencies_goal_not_active).
+ """
+ 
++from collections.abc import Mapping
++from typing import Any
+ from uuid import UUID
+ 
+ from psycopg import Connection, sql
+ 
+ from app.models.competency import CompetencyRecord, ExpectedLevel, Importance, KnowledgeType
+-from app.repositories._sql import fetch_all, fetch_one
++from app.repositories._sql import fetch_all, fetch_one, set_clause
++
++# Same as the column-level UPDATE grant of the authenticated role, without `status`:
++# the status only changes through archive_active().
++UPDATABLE_COLUMNS = (
++    "name",
++    "description",
++    "rationale",
++    "category",
++    "knowledge_type",
++    "importance",
++    "expected_level",
++    "display_order",
++)
+ 
+ _COLUMNS = sql.SQL(
+     "id, career_goal_id, user_id, name, description, rationale, category, knowledge_type, "
+@@ -79,3 +99,33 @@ def insert(
+     if record is None:  # INSERT ... RETURNING always yields the row
+         raise RuntimeError("INSERT returned no row")
+     return record
++
++
++def get_by_id(conn: Connection, user_id: UUID, competency_id: UUID) -> CompetencyRecord | None:
++    """A competency of this user in any status (None if it does not exist or is not theirs)."""
++    query = sql.SQL("SELECT {columns} FROM public.competencies WHERE id = %s AND user_id = %s")
++    return fetch_one(
++        conn, CompetencyRecord, query.format(columns=_COLUMNS), [competency_id, user_id]
++    )
++
++
++def update_active(
++    conn: Connection, user_id: UUID, competency_id: UUID, changes: Mapping[str, Any]
++) -> CompetencyRecord | None:
++    """Set the given columns (see UPDATABLE_COLUMNS) of an ACTIVE competency of this user in an
++    active goal. None if there is no such competency; nothing was changed."""
++    assignments, values = set_clause(changes, UPDATABLE_COLUMNS)
++    query = sql.SQL(
++        "UPDATE public.competencies SET {assignments} "
++        "WHERE id = %s AND user_id = %s AND status = 'active' RETURNING {columns}"
++    ).format(assignments=assignments, columns=_COLUMNS)
++    return fetch_one(conn, CompetencyRecord, query, [*values, competency_id, user_id])
++
++
++def archive_active(conn: Connection, user_id: UUID, competency_id: UUID) -> CompetencyRecord | None:
++    """Archive an ACTIVE competency of this user in an active goal; None if there is none."""
++    query = sql.SQL(
++        "UPDATE public.competencies SET status = 'archived' "
++        "WHERE id = %s AND user_id = %s AND status = 'active' RETURNING {columns}"
++    ).format(columns=_COLUMNS)
++    return fetch_one(conn, CompetencyRecord, query, [competency_id, user_id])
+diff --git a/backend/app/schemas/competency.py b/backend/app/schemas/competency.py
+index a020cdb..c289b39 100644
+--- a/backend/app/schemas/competency.py
++++ b/backend/app/schemas/competency.py
+@@ -1,14 +1,15 @@
+ """API schemas of competencies (docs/API-DESIGN.md, section 7).
+ 
+ The owner and the goal come from the token and the path, and the status is set by the database:
+-a competency is created active and is archived through its own endpoint (Stage 9.3). Therefore
++a competency is created active and is archived through its own endpoint. Therefore
+ `id`, `career_goal_id`, `user_id`, `status`, `created_at` and `updated_at` are rejected as unknown
+ fields, and the response never repeats `user_id`.
+ """
+ 
++from typing import Any
+ from uuid import UUID
+ 
+-from pydantic import BaseModel, ConfigDict
++from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+ 
+ from app.models.competency import CompetencyStatus, ExpectedLevel, Importance, KnowledgeType
+ from app.schemas.common import (
+@@ -17,6 +18,8 @@ from app.schemas.common import (
+     CompetencyText,
+     DisplayOrder,
+     UtcDatetime,
++    provided_fields,
++    reject_null,
+ )
+ 
+ 
+@@ -51,6 +54,44 @@ class CompetencyCreate(BaseModel):
+     display_order: DisplayOrder = 0
+ 
+ 
++class CompetencyUpdate(BaseModel):
++    """PATCH /competencies/{id}. A field that is left out is not changed. An explicit null (or
++    blank text) clears description, rationale and category; the other fields may not be null."""
++
++    model_config = ConfigDict(
++        extra="forbid",
++        json_schema_extra={"examples": [{"importance": "critical", "category": None}]},
++    )
++
++    name: CompetencyName | None = None
++    description: CompetencyText = None
++    rationale: CompetencyText = None
++    category: CompetencyCategory = None
++    knowledge_type: KnowledgeType | None = None
++    importance: Importance | None = None
++    expected_level: ExpectedLevel | None = None
++    display_order: DisplayOrder | None = None
++
++    _required_fields_not_null = field_validator(
++        "name",
++        "knowledge_type",
++        "importance",
++        "expected_level",
++        "display_order",
++        mode="before",
++    )(reject_null)
++
++    @model_validator(mode="after")
++    def _at_least_one_field(self) -> "CompetencyUpdate":
++        if not self.model_fields_set:
++            raise ValueError("at least one field must be provided")
++        return self
++
++    def changes(self) -> dict[str, Any]:
++        """Column -> new value for exactly the fields the client sent."""
++        return dict(provided_fields(self))
++
++
+ class CompetencyResponse(BaseModel):
+     """A competency as returned by the API (user_id is not repeated: it is the caller)."""
+ 
+diff --git a/backend/app/services/competency_service.py b/backend/app/services/competency_service.py
+index 4d698f7..8de5a2d 100644
+--- a/backend/app/services/competency_service.py
++++ b/backend/app/services/competency_service.py
+@@ -2,17 +2,20 @@
+ 
+ Reading uses one plain user_transaction(). Writing uses run_user_transaction(), which repeats
+ the whole transaction on a deadlock or a serialization failure (see app/db/session.py); the
+-repeatable work is the repository INSERT and nothing else.
++repeatable work is database statements only: one write and, if an UPDATE changed
++nothing, the reads that explain why.
+ 
+ Nothing is checked before a write (no check-then-insert). The rules live in the database: the row
+ trigger refuses a goal that is not active (23514, competencies_goal_not_active) and the 51st
+ active competency (23514, competencies_active_limit), and the unique index refuses an active name
+-that is taken (23505, competencies_active_name_unique). This module only gives those outcomes
++that is taken (23505, competencies_active_name_unique). An UPDATE of a competency that cannot be
++changed matches no row and raises nothing. This module only gives those outcomes
+ their business meaning, by CONSTRAINT NAME and never by message text. The `except` clauses are
+ outside run_user_transaction(): by the time they run, the failed transaction has been rolled back
+ and its connection released, so a follow-up query can use a fresh transaction.
+ """
+ 
++from collections.abc import Callable
+ from typing import NoReturn
+ from uuid import UUID
+ 
+@@ -21,8 +24,10 @@ from psycopg.errors import CheckViolation, UniqueViolation
+ from psycopg_pool import ConnectionPool
+ 
+ from app.core.errors import (
++    CompetencyArchivedError,
+     CompetencyLimitReachedError,
+     CompetencyNameExistsError,
++    CompetencyNotFoundError,
+     GoalArchivedError,
+     GoalNotFoundError,
+ )
+@@ -30,7 +35,7 @@ from app.db.session import run_user_transaction, user_transaction
+ from app.models.auth import AuthenticatedUser
+ from app.models.competency import CompetencyRecord
+ from app.repositories import career_goals, competencies
+-from app.schemas.competency import CompetencyCreate
++from app.schemas.competency import CompetencyCreate, CompetencyUpdate
+ 
+ ACTIVE_LIMIT_CONSTRAINT = "competencies_active_limit"
+ GOAL_NOT_ACTIVE_CONSTRAINT = "competencies_goal_not_active"
+@@ -89,6 +94,79 @@ def create_competency(
+         raise
+ 
+ 
++def update_competency(
++    pool: ConnectionPool, user: AuthenticatedUser, competency_id: UUID, data: CompetencyUpdate
++) -> CompetencyRecord:
++    """Change the sent fields of an active competency in the user's active goal."""
++    changes = data.changes()
++    try:
++        return _change_active(
++            pool,
++            user,
++            competency_id,
++            lambda conn: competencies.update_active(conn, user.id, competency_id, changes),
++        )
++    except UniqueViolation as exc:
++        if exc.diag.constraint_name == ACTIVE_NAME_CONSTRAINT:
++            raise CompetencyNameExistsError from exc
++        raise
++
++
++def archive_competency(
++    pool: ConnectionPool, user: AuthenticatedUser, competency_id: UUID
++) -> CompetencyRecord:
++    """Archive an active competency in the user's active goal. It cannot be undone."""
++    return _change_active(
++        pool,
++        user,
++        competency_id,
++        lambda conn: competencies.archive_active(conn, user.id, competency_id),
++    )
++
++
++def _change_active(
++    pool: ConnectionPool,
++    user: AuthenticatedUser,
++    competency_id: UUID,
++    change: Callable[[Connection], CompetencyRecord | None],
++) -> CompetencyRecord:
++    """Run one UPDATE of an active competency and explain it if it was not applied."""
++
++    def apply(conn: Connection) -> CompetencyRecord:
++        record = change(conn)
++        if record is None:
++            _raise_unchanged_reason(conn, user, competency_id)
++        return record
++
++    try:
++        return run_user_transaction(pool, user, apply)
++    except CheckViolation as exc:
++        if exc.diag.constraint_name != GOAL_NOT_ACTIVE_CONSTRAINT:
++            raise
++        # The goal was archived while the UPDATE waited for its lock. The failed transaction is
++        # gone, so the reason is read in a new one, with the same precedence as above.
++        with user_transaction(pool, user) as conn:
++            _raise_unchanged_reason(conn, user, competency_id)
++
++
++def _raise_unchanged_reason(
++    conn: Connection, user: AuthenticatedUser, competency_id: UUID
++) -> NoReturn:
++    """Explain why a competency could not be changed. The order is part of the API contract:
++    not visible, then the competency itself is archived, then its goal is archived."""
++    competency = competencies.get_by_id(conn, user.id, competency_id)
++    if competency is None:  # missing, or another user's competency hidden by RLS
++        raise CompetencyNotFoundError
++    if competency.status == "archived":
++        raise CompetencyArchivedError
++    goal = career_goals.get_by_id(conn, user.id, competency.career_goal_id)
++    if goal is not None and goal.status == "archived":
++        raise GoalArchivedError
++    # Competency and goal are active although the database did not apply the change. Both only
++    # ever go from active to archived, so this is a bug, not a client error (500).
++    raise RuntimeError("the active competency was not changed")
++
++
+ def _raise_goal_problem(
+     pool: ConnectionPool, user: AuthenticatedUser, goal_id: UUID, cause: CheckViolation
+ ) -> NoReturn:
+diff --git a/backend/tests/test_competencies_api.py b/backend/tests/test_competencies_api.py
+index ebe5eda..156bede 100644
+--- a/backend/tests/test_competencies_api.py
++++ b/backend/tests/test_competencies_api.py
+@@ -1,4 +1,4 @@
+-"""HTTP tests of GET and POST /api/v1/career-goals/{goal_id}/competencies, no database.
++"""HTTP tests of the competency endpoints (list, add, update, archive), no database.
+ 
+ Requests go through the real application (`app.main.app`): routing, authentication dependency,
+ request validation, response model and the central error handlers. Only the service layer is
+@@ -19,15 +19,17 @@ import app.api.competencies as competencies_api
+ from app import main
+ from app.api.deps import get_current_user, get_db_pool
+ from app.core.errors import (
++    CompetencyArchivedError,
+     CompetencyLimitReachedError,
+     CompetencyNameExistsError,
++    CompetencyNotFoundError,
+     GoalArchivedError,
+     GoalNotFoundError,
+ )
+ from app.db.errors import DatabaseUnavailableError
+ from app.models.auth import AuthenticatedUser
+ from app.models.competency import CompetencyRecord
+-from app.schemas.competency import CompetencyCreate
++from app.schemas.competency import CompetencyCreate, CompetencyUpdate
+ 
+ USER = AuthenticatedUser(id=UUID("11111111-1111-1111-1111-111111111111"))
+ GOAL_ID = UUID("22222222-2222-2222-2222-222222222222")
+@@ -87,6 +89,21 @@ class FakeService:
+         self.calls: list[tuple[str, Any, Any, UUID, Any]] = []
+         self.listed: list[CompetencyRecord] | BaseException = [record()]
+         self.created: CompetencyRecord | BaseException = record()
++        self.changed: CompetencyRecord | BaseException = record()
++
++    def update_competency(
++        self, pool: Any, user: Any, competency_id: UUID, data: CompetencyUpdate
++    ) -> CompetencyRecord:
++        return self._change("update", pool, user, competency_id, data)
++
++    def archive_competency(self, pool: Any, user: Any, competency_id: UUID) -> CompetencyRecord:
++        return self._change("archive", pool, user, competency_id, None)
++
++    def _change(self, *call: Any) -> CompetencyRecord:
++        self.calls.append(call)
++        if isinstance(self.changed, BaseException):
++            raise self.changed
++        return self.changed
+ 
+     def list_competencies(self, pool: Any, user: Any, goal_id: UUID) -> list[CompetencyRecord]:
+         self.calls.append(("list", pool, user, goal_id, None))
+@@ -112,6 +129,8 @@ def service(monkeypatch: pytest.MonkeyPatch) -> FakeService:
+     monkeypatch.setattr(
+         competencies_api.competency_service, "create_competency", fake.create_competency
+     )
++    for name in ("update_competency", "archive_competency"):
++        monkeypatch.setattr(competencies_api.competency_service, name, getattr(fake, name))
+     return fake
+ 
+ 
+@@ -455,3 +474,156 @@ def test_a_database_timeout_is_504(client: TestClient, service: FakeService, met
+     response = client.request(method.upper(), URL, json=VALID if method == "post" else None)
+ 
+     assert_error(response, 504, "DATABASE_TIMEOUT")
++
++
++# --- PATCH /competencies/{id} and POST /competencies/{id}/archive ------------------------------
++
++ITEM_URL = f"/api/v1/competencies/{COMPETENCY_ID}"
++ARCHIVE_URL = f"{ITEM_URL}/archive"
++
++
++def patch_item(client: TestClient) -> Any:
++    return client.patch(ITEM_URL, json={"name": "Git"})
++
++
++def archive_item(client: TestClient) -> Any:
++    return client.post(ARCHIVE_URL)
++
++
++ITEM_CALLS = pytest.mark.parametrize("call", [patch_item, archive_item], ids=["patch", "archive"])
++
++
++def test_the_item_handlers_are_plain_functions() -> None:
++    assert not inspect.iscoroutinefunction(competencies_api.update_competency)
++    assert not inspect.iscoroutinefunction(competencies_api.archive_competency)
++
++
++@pytest.mark.parametrize(
++    ("method", "url", "allow"),
++    [
++        ("get", ITEM_URL, "PATCH"),
++        ("delete", ITEM_URL, "PATCH"),
++        ("put", ITEM_URL, "PATCH"),
++        ("get", ARCHIVE_URL, "POST"),
++        ("patch", ARCHIVE_URL, "POST"),
++    ],
++)
++def test_other_methods_of_the_item_paths_answer_405(
++    client: TestClient, method: str, url: str, allow: str
++) -> None:
++    response = getattr(client, method)(url)
++
++    assert_error(response, 405, "METHOD_NOT_ALLOWED")
++    assert response.headers["allow"] == allow
++
++
++def test_patch_returns_the_updated_competency_without_the_owner(
++    client: TestClient, service: FakeService
++) -> None:
++    service.changed = record(name="Git")
++
++    response = patch_item(client)
++
++    assert response.status_code == 200
++    assert set(response.json()) == RESPONSE_FIELDS
++    assert response.json()["name"] == "Git"
++    assert str(USER.id) not in response.text
++
++
++def test_patch_passes_the_user_the_id_and_only_the_sent_fields(
++    client: TestClient, service: FakeService
++) -> None:
++    client.patch(ITEM_URL, json={"importance": "low", "description": None})
++
++    ((name, pool, user, competency_id, data),) = service.calls
++    assert (name, pool, user, competency_id) == ("update", POOL, USER, COMPETENCY_ID)
++    assert data.changes() == {"importance": "low", "description": None}
++
++
++def test_archive_returns_the_archived_competency(client: TestClient, service: FakeService) -> None:
++    service.changed = record(status="archived")
++
++    response = archive_item(client)
++
++    assert response.status_code == 200
++    assert set(response.json()) == RESPONSE_FIELDS
++    assert response.json()["status"] == "archived"
++    assert service.calls == [("archive", POOL, USER, COMPETENCY_ID, None)]
++
++
++@pytest.mark.parametrize(
++    "body",
++    [
++        {},
++        {"name": None},
++        {"name": " "},
++        {"display_order": None},
++        {"display_order": "1"},
++        {"status": "archived"},
++        {"career_goal_id": str(GOAL_ID)},
++        {"name": "Git", "user_id": str(USER.id)},
++        {"importance": "urgent"},
++        [],
++        None,
++    ],
++)
++def test_an_invalid_patch_is_422_and_does_not_reach_the_service(
++    client: TestClient, service: FakeService, body: Any
++) -> None:
++    response = client.patch(ITEM_URL, json=body)
++
++    error = assert_error(response, 422, "VALIDATION_ERROR")
++    assert error["details"]
++    assert service.calls == []
++
++
++@pytest.mark.parametrize(
++    ("method", "url", "body"),
++    [
++        ("patch", "/api/v1/competencies/not-a-uuid", {"name": "Git"}),
++        ("post", "/api/v1/competencies/not-a-uuid/archive", None),
++    ],
++)
++def test_a_malformed_competency_id_is_422(
++    client: TestClient, service: FakeService, method: str, url: str, body: Any
++) -> None:
++    response = client.request(method.upper(), url, json=body)
++
++    error = assert_error(response, 422, "VALIDATION_ERROR")
++    assert "competency_id" in {d["field"] for d in error["details"]}
++    assert service.calls == []
++
++
++@ITEM_CALLS
++@pytest.mark.parametrize(
++    ("raised", "status", "code"),
++    [
++        (CompetencyNotFoundError(), 404, "COMPETENCY_NOT_FOUND"),
++        (CompetencyArchivedError(), 409, "COMPETENCY_ARCHIVED"),
++        (GoalArchivedError(), 409, "GOAL_ARCHIVED"),
++        (CompetencyNameExistsError(), 409, "COMPETENCY_NAME_EXISTS"),
++        (DatabaseUnavailableError("database unavailable"), 503, "SERVICE_UNAVAILABLE"),
++        (pg_errors.QueryCanceled("statement timeout"), 504, "DATABASE_TIMEOUT"),
++    ],
++)
++def test_service_errors_of_the_item_endpoints_become_api_errors(
++    client: TestClient,
++    service: FakeService,
++    call: Any,
++    raised: BaseException,
++    status: int,
++    code: str,
++) -> None:
++    service.changed = raised
++
++    assert_error(call(client), status, code)
++
++
++@ITEM_CALLS
++def test_the_item_endpoints_require_a_token(service: FakeService, call: Any) -> None:
++    # No dependency overrides: the real authentication dependency rejects the request.
++    response = call(TestClient(main.app, raise_server_exceptions=False))
++
++    assert_error(response, 401, "UNAUTHORIZED")
++    assert response.headers["www-authenticate"] == "Bearer"
++    assert service.calls == []
+diff --git a/backend/tests/test_competency_repository.py b/backend/tests/test_competency_repository.py
+index 909985c..bbe4c3a 100644
+--- a/backend/tests/test_competency_repository.py
++++ b/backend/tests/test_competency_repository.py
+@@ -404,3 +404,99 @@ def test_the_repository_only_asks_the_connection_for_a_cursor(
+ ) -> None:
+     # FakeConnection raises AssertionError on transaction(), commit(), rollback(), close() ...
+     call(FakeConnection([row()]))
++
++
++# --- get_by_id, update_active, archive_active ---------------------------------------------------
++
++COMPETENCY_ID = UUID("33333333-3333-3333-3333-333333333333")
++
++
++def get_one(conn: FakeConnection) -> CompetencyRecord | None:
++    return competencies.get_by_id(conn, USER_ID, COMPETENCY_ID)  # type: ignore[arg-type]
++
++
++def update(conn: FakeConnection, **changes: Any) -> CompetencyRecord | None:
++    return competencies.update_active(
++        conn,
++        USER_ID,
++        COMPETENCY_ID,
++        changes or {"name": "Git"},  # type: ignore[arg-type]
++    )
++
++
++def archive(conn: FakeConnection) -> CompetencyRecord | None:
++    return competencies.archive_active(conn, USER_ID, COMPETENCY_ID)  # type: ignore[arg-type]
++
++
++def test_get_by_id_is_scoped_to_the_owner_and_returns_any_status() -> None:
++    conn = FakeConnection([row(status="archived")])
++
++    record = get_one(conn)
++
++    assert record is not None and record.status == "archived"
++    ((statement, params),) = conn.statements
++    assert statement == (
++        f"SELECT {', '.join(FIELDS)} FROM public.competencies WHERE id = %s AND user_id = %s"
++    )
++    assert params == [COMPETENCY_ID, USER_ID]
++
++
++def test_update_sets_only_the_given_columns_of_an_active_competency_of_the_user() -> None:
++    conn = FakeConnection([row(name="Git", category=None)])
++
++    record = update(conn, name="Git", category=None)
++
++    assert record is not None and record.name == "Git"
++    ((statement, params),) = conn.statements
++    assert statement == (
++        'UPDATE public.competencies SET "name" = %s, "category" = %s '
++        f"WHERE id = %s AND user_id = %s AND status = 'active' RETURNING {', '.join(FIELDS)}"
++    )
++    assert params == ["Git", None, COMPETENCY_ID, USER_ID]
++
++
++@pytest.mark.parametrize(
++    "column", ["status", "id", "user_id", "career_goal_id", "created_at", "updated_at"]
++)
++def test_update_refuses_a_column_that_is_not_updatable(column: str) -> None:
++    conn = FakeConnection([row()])
++
++    with pytest.raises(ValueError, match="cannot be updated"):
++        update(conn, **{column: "x"})
++
++    assert conn.statements == []
++
++
++def test_archive_only_sets_the_status_of_an_active_competency_of_the_user() -> None:
++    conn = FakeConnection([row(status="archived")])
++
++    record = archive(conn)
++
++    assert record is not None and record.status == "archived"
++    ((statement, params),) = conn.statements
++    assert statement == (
++        "UPDATE public.competencies SET status = 'archived' "
++        f"WHERE id = %s AND user_id = %s AND status = 'active' RETURNING {', '.join(FIELDS)}"
++    )
++    assert params == [COMPETENCY_ID, USER_ID]
++
++
++@pytest.mark.parametrize("call", [get_one, update, archive], ids=["get", "update", "archive"])
++def test_no_matching_row_gives_none_after_one_statement(
++    call: Callable[[FakeConnection], Any],
++) -> None:
++    conn = FakeConnection([])
++
++    assert call(conn) is None
++    assert len(conn.statements) == 1
++
++
++@pytest.mark.parametrize("call", [get_one, update, archive], ids=["get", "update", "archive"])
++def test_database_errors_of_the_item_statements_are_not_caught(
++    call: Callable[[FakeConnection], Any],
++) -> None:
++    conn = FakeConnection([row()])
++    conn.error = errors.CheckViolation("refused")
++
++    with pytest.raises(errors.CheckViolation):
++        call(conn)
+diff --git a/backend/tests/test_competency_schemas.py b/backend/tests/test_competency_schemas.py
+index bd5636e..19832a2 100644
+--- a/backend/tests/test_competency_schemas.py
++++ b/backend/tests/test_competency_schemas.py
+@@ -25,6 +25,7 @@ from app.schemas.competency import (
+     CompetencyCreate,
+     CompetencyListResponse,
+     CompetencyResponse,
++    CompetencyUpdate,
+ )
+ from tests.test_schemas import _migration, _normalized, errors_of
+ 
+@@ -375,3 +376,91 @@ def test_the_record_has_exactly_the_columns_of_the_table() -> None:
+     columns = {part.split()[0] for part in table.split(",") if part.strip()}
+ 
+     assert columns == set(CompetencyRecord.model_fields)
++
++
++# --- CompetencyUpdate (PATCH) ------------------------------------------------------------------
++
++NOT_NULLABLE = ["name", "knowledge_type", "importance", "expected_level", "display_order"]
++
++
++@pytest.mark.parametrize(
++    ("field", "value"),
++    [
++        ("name", "Kubernetes"),
++        ("description", "Orchestration."),
++        ("rationale", "Common."),
++        ("category", "Containers"),
++        ("knowledge_type", "memory"),
++        ("importance", "low"),
++        ("expected_level", "advanced"),
++        ("display_order", 0),
++    ],
++)
++def test_update_changes_contain_only_the_field_that_was_sent(field: str, value: Any) -> None:
++    assert CompetencyUpdate.model_validate({field: value}).changes() == {field: value}
++
++
++@pytest.mark.parametrize("field", TEXT_FIELDS)
++@pytest.mark.parametrize("value", [None, "", "  \n "], ids=["null", "empty", "blank"])
++def test_update_clears_an_optional_text_with_null_or_blank(field: str, value: Any) -> None:
++    assert CompetencyUpdate.model_validate({field: value}).changes() == {field: None}
++
++
++@pytest.mark.parametrize("field", NOT_NULLABLE)
++def test_update_rejects_null_for_a_required_column(field: str) -> None:
++    with pytest.raises(ValidationError) as exc_info:
++        CompetencyUpdate.model_validate({field: None})
++
++    assert errors_of(exc_info)[0][0] == (field,)
++
++
++def test_update_requires_at_least_one_field() -> None:
++    with pytest.raises(ValidationError, match="at least one field"):
++        CompetencyUpdate.model_validate({})
++
++
++@pytest.mark.parametrize(
++    "field",
++    ["id", "career_goal_id", "user_id", "status", "created_at", "updated_at", "unknown"],
++)
++def test_update_rejects_fields_the_client_may_not_send(field: str) -> None:
++    with pytest.raises(ValidationError) as exc_info:
++        CompetencyUpdate.model_validate({"name": "Git", field: "x"})
++
++    assert errors_of(exc_info)[0][0] == (field,)
++
++
++@pytest.mark.parametrize(
++    ("field", "value"),
++    [
++        ("name", "   "),
++        ("name", "x" * (COMPETENCY_NAME_MAX_LENGTH + 1)),
++        ("name", "a\x00b"),
++        ("description", "d" * (COMPETENCY_TEXT_MAX_LENGTH + 1)),
++        ("rationale", "r" * (COMPETENCY_TEXT_MAX_LENGTH + 1)),
++        ("category", "c" * (COMPETENCY_CATEGORY_MAX_LENGTH + 1)),
++        ("knowledge_type", "magic"),
++        ("importance", "urgent"),
++        ("expected_level", "not_assessed"),
++        ("display_order", -1),
++        ("display_order", DISPLAY_ORDER_MAX + 1),
++        ("display_order", "5"),
++        ("display_order", 5.0),
++        ("display_order", True),
++    ],
++)
++def test_update_applies_the_same_value_rules_as_create(field: str, value: Any) -> None:
++    with pytest.raises(ValidationError) as exc_info:
++        CompetencyUpdate.model_validate({field: value})
++
++    assert errors_of(exc_info)[0][0][0] == field
++
++
++def test_update_strips_surrounding_whitespace() -> None:
++    update = CompetencyUpdate.model_validate({"name": "  Git \n", "category": " VCS "})
++
++    assert update.changes() == {"name": "Git", "category": "VCS"}
++
++
++def test_update_offers_the_same_fields_as_create() -> None:
++    assert list(CompetencyUpdate.model_fields) == list(CompetencyCreate.model_fields)
+diff --git a/backend/tests/test_competency_service.py b/backend/tests/test_competency_service.py
+index 57516e9..d434098 100644
+--- a/backend/tests/test_competency_service.py
++++ b/backend/tests/test_competency_service.py
+@@ -19,8 +19,10 @@ from psycopg import errors
+ 
+ from app.core.errors import (
+     AppError,
++    CompetencyArchivedError,
+     CompetencyLimitReachedError,
+     CompetencyNameExistsError,
++    CompetencyNotFoundError,
+     GoalArchivedError,
+     GoalNotFoundError,
+ )
+@@ -29,7 +31,7 @@ from app.db.errors import DatabaseUnavailableError
+ from app.models.auth import AuthenticatedUser
+ from app.models.career_goal import CareerGoalRecord
+ from app.models.competency import CompetencyRecord
+-from app.schemas.competency import CompetencyCreate
++from app.schemas.competency import CompetencyCreate, CompetencyUpdate
+ from app.services import competency_service
+ from tests.db_fakes import FakeUserConnection, FakeUserPool
+ from tests.test_competency_schemas import make_record
+@@ -92,7 +94,13 @@ class Repos:
+         self.competencies = MagicMock()
+         self.career_goals = MagicMock()
+         for module in (self.competencies, self.career_goals):
+-            for name in ("insert", "list_by_goal", "get_by_id"):
++            for name in (
++                "insert",
++                "list_by_goal",
++                "get_by_id",
++                "update_active",
++                "archive_active",
++            ):
+                 getattr(module, name).side_effect = self._unexpected(name)
+ 
+     def _unexpected(self, name: str) -> Callable[..., Any]:
+@@ -487,3 +495,205 @@ def test_the_service_does_not_depend_on_fastapi_or_http() -> None:
+ 
+     for forbidden in ("fastapi", "starlette", "HTTPException", "status_code"):
+         assert forbidden not in source
++
++
++# --- update_competency and archive_competency ---------------------------------------------------
++
++COMPETENCY_ID = UUID("33333333-3333-3333-3333-333333333333")
++PATCH = CompetencyUpdate(name="Kubernetes", category=None)
++
++
++def update(pool: FakeUserPool) -> CompetencyRecord:
++    return competency_service.update_competency(pool, USER, COMPETENCY_ID, PATCH)  # type: ignore[arg-type]
++
++
++def archive(pool: FakeUserPool) -> CompetencyRecord:
++    return competency_service.archive_competency(pool, USER, COMPETENCY_ID)  # type: ignore[arg-type]
++
++
++CHANGES = pytest.mark.parametrize(
++    ("call", "statement"),
++    [(update, "update_active"), (archive, "archive_active")],
++    ids=["update", "archive"],
++)
++
++
++@CHANGES
++def test_a_change_that_applies_uses_one_transaction_and_reads_nothing(
++    pool: FakeUserPool, repos: Repos, call: Callable[..., Any], statement: str
++) -> None:
++    record = make_record()
++    repos.script(repos.competencies, statement, record)
++
++    assert call(pool) is record
++
++    assert pool.events == [*START, f"repo.{statement}", "COMMIT", "pool.release"]
++    repos.competencies.get_by_id.assert_not_called()
++    repos.career_goals.get_by_id.assert_not_called()
++
++
++def test_update_sends_exactly_the_fields_of_the_request(pool: FakeUserPool, repos: Repos) -> None:
++    repos.script(repos.competencies, "update_active", make_record())
++
++    update(pool)
++
++    repos.competencies.update_active.assert_called_once_with(
++        pool.conn, USER.id, COMPETENCY_ID, {"name": "Kubernetes", "category": None}
++    )
++
++
++def test_archive_takes_the_owner_from_the_token(pool: FakeUserPool, repos: Repos) -> None:
++    repos.script(repos.competencies, "archive_active", make_record(status="archived"))
++
++    archive(pool)
++
++    repos.competencies.archive_active.assert_called_once_with(pool.conn, USER.id, COMPETENCY_ID)
++
++
++REASONS = pytest.mark.parametrize(
++    ("competency_status", "goal_status", "expected"),
++    [
++        (None, None, CompetencyNotFoundError),
++        ("archived", "active", CompetencyArchivedError),
++        ("archived", "archived", CompetencyArchivedError),  # the resource before its parent
++        ("active", "archived", GoalArchivedError),
++    ],
++    ids=["missing", "archived", "both-archived", "goal-archived"],
++)
++
++
++def script_state(repos: Repos, competency_status: str | None, goal_status: str | None) -> None:
++    found = None if competency_status is None else make_record(status=competency_status)
++    repos.script(repos.competencies, "get_by_id", found)
++    if competency_status == "active":
++        repos.script(repos.career_goals, "get_by_id", goal(goal_status or "active"))
++
++
++@CHANGES
++@REASONS
++def test_a_change_that_matches_no_row_is_explained(
++    pool: FakeUserPool,
++    repos: Repos,
++    call: Callable[..., Any],
++    statement: str,
++    competency_status: str | None,
++    goal_status: str | None,
++    expected: type[AppError],
++) -> None:
++    repos.script(repos.competencies, statement, None)
++    script_state(repos, competency_status, goal_status)
++
++    with pytest.raises(expected):
++        call(pool)
++
++    assert pool.events.count("pool.acquire") == 1
++    assert "ROLLBACK" in pool.events and "COMMIT" not in pool.events
++
++
++@CHANGES
++@pytest.mark.parametrize("found_goal", [goal("active"), None], ids=["active-goal", "no-goal"])
++def test_an_unexplained_unchanged_row_is_a_bug_and_not_a_client_error(
++    pool: FakeUserPool,
++    repos: Repos,
++    call: Callable[..., Any],
++    statement: str,
++    found_goal: CareerGoalRecord | None,
++) -> None:
++    repos.script(repos.competencies, statement, None)
++    repos.script(repos.competencies, "get_by_id", make_record())
++    repos.script(repos.career_goals, "get_by_id", found_goal)
++
++    with pytest.raises(RuntimeError, match="was not changed"):
++        call(pool)
++
++
++@CHANGES
++@REASONS
++def test_a_trigger_refusal_is_explained_in_a_new_transaction(
++    pool: FakeUserPool,
++    repos: Repos,
++    call: Callable[..., Any],
++    statement: str,
++    competency_status: str | None,
++    goal_status: str | None,
++    expected: type[AppError],
++) -> None:
++    refusal = violation(errors.CheckViolation, "competencies_goal_not_active")
++    repos.script(repos.competencies, statement, refusal)
++    script_state(repos, competency_status, goal_status)
++
++    with pytest.raises(expected):
++        call(pool)
++
++    assert pool.events.count("pool.acquire") == 2
++    # the failed transaction is rolled back and released before anything is read
++    first_release = pool.events.index("pool.release")
++    assert pool.events.index("ROLLBACK") < first_release
++    assert first_release < pool.events.index("repo.get_by_id")
++
++
++@pytest.mark.parametrize("constraint", ["competencies_name_check", None])
++@CHANGES
++def test_another_check_violation_of_a_change_is_not_translated(
++    pool: FakeUserPool,
++    repos: Repos,
++    call: Callable[..., Any],
++    statement: str,
++    constraint: str | None,
++) -> None:
++    refusal = violation(errors.CheckViolation, constraint)
++    repos.script(repos.competencies, statement, refusal)
++
++    with pytest.raises(errors.CheckViolation) as exc_info:
++        call(pool)
++
++    assert exc_info.value is refusal
++
++
++def test_a_rename_to_a_taken_name_is_a_name_conflict(pool: FakeUserPool, repos: Repos) -> None:
++    taken = violation(errors.UniqueViolation, "competencies_active_name_unique")
++    repos.script(repos.competencies, "update_active", taken)
++
++    with pytest.raises(CompetencyNameExistsError):
++        update(pool)
++
++    assert pool.events.count("pool.acquire") == 1
++
++
++def test_another_unique_violation_of_an_update_is_not_translated(
++    pool: FakeUserPool, repos: Repos
++) -> None:
++    other = violation(errors.UniqueViolation, "competencies_pkey")
++    repos.script(repos.competencies, "update_active", other)
++
++    with pytest.raises(errors.UniqueViolation):
++        update(pool)
++
++
++@CHANGES
++@pytest.mark.parametrize("failure", [deadlock, serialization], ids=["deadlock", "serialization"])
++def test_a_change_is_retried_as_a_whole_transaction(
++    pool: FakeUserPool,
++    repos: Repos,
++    call: Callable[..., Any],
++    statement: str,
++    failure: Callable[[], BaseException],
++) -> None:
++    record = make_record()
++    repos.script(repos.competencies, statement, failure(), record)
++
++    assert call(pool) is record
++    assert pool.events.count("pool.acquire") == 2
++    assert pool.events.count("COMMIT") == 1
++
++
++@CHANGES
++def test_a_change_that_keeps_failing_is_reported_as_unavailable(
++    pool: FakeUserPool, repos: Repos, call: Callable[..., Any], statement: str
++) -> None:
++    repos.script(repos.competencies, statement, deadlock())
++
++    with pytest.raises(DatabaseUnavailableError):
++        call(pool)
++
++    assert pool.events.count("pool.acquire") == session.RETRY_MAX_ATTEMPTS
+diff --git a/backend/tests/test_domain_errors.py b/backend/tests/test_domain_errors.py
+index 3615dce..efb97a0 100644
+--- a/backend/tests/test_domain_errors.py
++++ b/backend/tests/test_domain_errors.py
+@@ -6,8 +6,10 @@ from app.core import errors
+ from app.core.errors import (
+     ActiveGoalExistsError,
+     AppError,
++    CompetencyArchivedError,
+     CompetencyLimitReachedError,
+     CompetencyNameExistsError,
++    CompetencyNotFoundError,
+     GoalArchivedError,
+     GoalNotFoundError,
+     NoActiveGoalError,
+@@ -23,6 +25,8 @@ from app.core.errors import (
+         (NoActiveGoalError, 404, "NO_ACTIVE_GOAL"),
+         (ActiveGoalExistsError, 409, "ACTIVE_GOAL_EXISTS"),
+         (GoalArchivedError, 409, "GOAL_ARCHIVED"),
++        (CompetencyNotFoundError, 404, "COMPETENCY_NOT_FOUND"),
++        (CompetencyArchivedError, 409, "COMPETENCY_ARCHIVED"),
+         (CompetencyLimitReachedError, 409, "COMPETENCY_LIMIT_REACHED"),
+         (CompetencyNameExistsError, 409, "COMPETENCY_NAME_EXISTS"),
+     ],
+@@ -44,7 +48,7 @@ def test_codes_are_unique() -> None:
+     subclasses = AppError.__subclasses__()
+     codes = [cls.code for cls in subclasses]
+ 
+-    assert len(codes) == len(set(codes)) == 7
++    assert len(codes) == len(set(codes)) == 9
+ 
+ 
+ def test_errors_module_does_not_depend_on_fastapi() -> None:
+diff --git a/backend/tests/test_openapi_contract.py b/backend/tests/test_openapi_contract.py
+index 7d4a8e3..e2455e3 100644
+--- a/backend/tests/test_openapi_contract.py
++++ b/backend/tests/test_openapi_contract.py
+@@ -26,7 +26,9 @@ from app.api.deps import get_current_user, get_db_pool
+ from app.core.errors import (
+     ActiveGoalExistsError,
+     AppError,
++    CompetencyArchivedError,
+     CompetencyNameExistsError,
++    CompetencyNotFoundError,
+     GoalArchivedError,
+     GoalNotFoundError,
+     NoActiveGoalError,
+@@ -35,7 +37,7 @@ from app.core.errors import (
+ from app.db.errors import DatabaseUnavailableError
+ from app.models.auth import AuthenticatedUser
+ from app.schemas.career_goal import CareerGoalCreate, CareerGoalResponse, CareerGoalUpdate
+-from app.schemas.competency import CompetencyCreate, CompetencyResponse
++from app.schemas.competency import CompetencyCreate, CompetencyResponse, CompetencyUpdate
+ from app.schemas.errors import ErrorResponse, ValidationErrorResponse
+ from app.schemas.profile import ProfileResponse, ProfileUpdate
+ 
+@@ -48,6 +50,8 @@ ACTIVE = f"{GOALS}/active"
+ ITEM = f"{GOALS}/{{goal_id}}"
+ ARCHIVE = f"{GOALS}/{{goal_id}}/archive"
+ COMPETENCIES = f"{GOALS}/{{goal_id}}/competencies"
++COMPETENCY = "/api/v1/competencies/{competency_id}"
++COMPETENCY_ARCHIVE = f"{COMPETENCY}/archive"
+ HEALTH = "/api/v1/health"
+ 
+ # (method, path) -> status -> the domain error codes documented for it (None: no domain code).
+@@ -84,6 +88,20 @@ EXPECTED: dict[tuple[str, str], dict[str, set[str] | None]] = {
+         "422": None,
+         **INFRA,
+     },
++    ("patch", COMPETENCY): {
++        "200": None,
++        "404": {"COMPETENCY_NOT_FOUND"},
++        "409": {"COMPETENCY_ARCHIVED", "GOAL_ARCHIVED", "COMPETENCY_NAME_EXISTS"},
++        "422": None,
++        **INFRA,
++    },
++    ("post", COMPETENCY_ARCHIVE): {
++        "200": None,
++        "404": {"COMPETENCY_NOT_FOUND"},
++        "409": {"COMPETENCY_ARCHIVED", "GOAL_ARCHIVED"},
++        "422": None,
++        **INFRA,
++    },
+ }
+ OPERATIONS = sorted(EXPECTED)
+ 
+@@ -168,6 +186,8 @@ def test_only_the_career_goal_401_mentions_a_user_that_no_longer_exists() -> Non
+     assert "no longer exists" not in description(COMPETENCIES, "get")
+     # A deleted user with a valid token gets 404 GOAL_NOT_FOUND (the goal is not visible).
+     assert "no longer exists" not in description(COMPETENCIES, "post")
++    assert "no longer exists" not in description(COMPETENCY, "patch")
++    assert "no longer exists" not in description(COMPETENCY_ARCHIVE, "post")
+     for method, path in (("post", GOALS), ("get", ACTIVE), ("patch", ITEM), ("post", ARCHIVE)):
+         assert "no longer exists" in description(path, method)
+ 
+@@ -194,6 +214,8 @@ def test_operation_ids_are_unchanged_and_unique() -> None:
+             "archive_career_goal_api_v1_career_goals__goal_id__archive_post",
+             "list_competencies_api_v1_career_goals__goal_id__competencies_get",
+             "create_competency_api_v1_career_goals__goal_id__competencies_post",
++            "update_competency_api_v1_competencies__competency_id__patch",
++            "archive_competency_api_v1_competencies__competency_id__archive_post",
+         ]
+     )
+ 
+@@ -252,6 +274,7 @@ def test_every_example_in_the_document_validates_against_its_model() -> None:
+         CareerGoalResponse,
+         CompetencyCreate,
+         CompetencyResponse,
++        CompetencyUpdate,
+         ProfileUpdate,
+         ProfileResponse,
+     ):
+@@ -285,7 +308,10 @@ def failing(monkeypatch: pytest.MonkeyPatch) -> Raises:
+             goals_api.career_goal_service,
+             ("create_goal", "get_active_goal", "update_goal", "archive_goal"),
+         ),
+-        (competencies_api.competency_service, ("list_competencies", "create_competency")),
++        (
++            competencies_api.competency_service,
++            ("list_competencies", "create_competency", "update_competency", "archive_competency"),
++        ),
+     ):
+         for name in names:
+             monkeypatch.setattr(module, name, raises)
+@@ -320,6 +346,8 @@ REQUESTS: dict[tuple[str, str], tuple[str, dict[str, Any] | None]] = {
+             "expected_level": "intermediate",
+         },
+     ),
++    ("patch", COMPETENCY): (f"/api/v1/competencies/{GOAL_ID}", {"name": "Git"}),
++    ("post", COMPETENCY_ARCHIVE): (f"/api/v1/competencies/{GOAL_ID}/archive", None),
+ }
+ 
+ # Status -> (exception the service raises, the code the documented response promises).
+@@ -339,6 +367,10 @@ DOMAIN = {
+     ("get", COMPETENCIES, "404"): GoalNotFoundError(),
+     ("post", COMPETENCIES, "404"): GoalNotFoundError(),
+     ("post", COMPETENCIES, "409"): CompetencyNameExistsError(),
++    ("patch", COMPETENCY, "404"): CompetencyNotFoundError(),
++    ("patch", COMPETENCY, "409"): CompetencyArchivedError(),
++    ("post", COMPETENCY_ARCHIVE, "404"): CompetencyNotFoundError(),
++    ("post", COMPETENCY_ARCHIVE, "409"): CompetencyArchivedError(),
+ }
+ 
+ 
+@@ -386,6 +418,8 @@ def test_real_domain_errors_match_the_documented_ones(
+         ("post", f"{GOALS}/not-a-uuid/archive", None),
+         ("post", f"{GOALS}/{GOAL_ID}/competencies", {"name": "Docker"}),
+         ("get", f"{GOALS}/not-a-uuid/competencies", None),
++        ("patch", f"/api/v1/competencies/{GOAL_ID}", {}),
++        ("post", "/api/v1/competencies/not-a-uuid/archive", None),
+     ],
+ )
+ def test_real_422_matches_the_validation_error_model(
+diff --git a/backend/tests/test_repositories.py b/backend/tests/test_repositories.py
+index 886ab50..b9f0638 100644
+--- a/backend/tests/test_repositories.py
++++ b/backend/tests/test_repositories.py
+@@ -11,7 +11,7 @@ from uuid import UUID
+ import pytest
+ from psycopg import sql
+ 
+-from app.repositories import _sql, career_goals, profiles
++from app.repositories import _sql, career_goals, competencies, profiles
+ 
+ USER_ID = UUID("11111111-1111-1111-1111-111111111111")
+ GOAL_ID = UUID("22222222-2222-2222-2222-222222222222")
+@@ -74,6 +74,16 @@ def test_allow_lists_match_the_column_grants_of_the_migrations() -> None:
+     assert profiles.UPDATABLE_COLUMNS == ("display_name", "preferred_language")
+     # `status` is deliberately absent: a goal is archived only through archive_active().
+     assert career_goals.UPDATABLE_COLUMNS == ("target_role", "seniority", "description")
++    assert competencies.UPDATABLE_COLUMNS == (
++        "name",
++        "description",
++        "rationale",
++        "category",
++        "knowledge_type",
++        "importance",
++        "expected_level",
++        "display_order",
++    )
+ 
+ 
+ # --- the SQL that is sent --------------------------------------------------------------------
+diff --git a/docs/API-DESIGN.md b/docs/API-DESIGN.md
+index c7adbe1..66ac252 100644
+--- a/docs/API-DESIGN.md
++++ b/docs/API-DESIGN.md
+@@ -111,8 +111,8 @@ FastAPI does not implement its own password management or token generation.
+ |Competencies|GET|`/career-goals/{id}/competencies`|List competencies (implemented, Stage 9.2)|
+ |Competencies|POST|`/career-goals/{id}/competencies/generate`|Generate competency map (deferred: AI stage, not in Stage 9)|
+ |Competencies|POST|`/career-goals/{id}/competencies`|Add competency (implemented, Stage 9.2)|
+-|Competencies|PATCH|`/competencies/{id}`|Update competency (planned, Stage 9.3)|
+-|Competencies|POST|`/competencies/{id}/archive`|Archive competency (planned, Stage 9.3)|
++|Competencies|PATCH|`/competencies/{id}`|Update competency (implemented, Stage 9.3)|
++|Competencies|POST|`/competencies/{id}/archive`|Archive competency (implemented, Stage 9.3)|
+ |Assessment|POST|`/assessments/diagnostic`|Start initial diagnostic|
+ |Assessment|POST|`/assessments/{id}/items`|Generate next diagnostic question|
+ |Assessment|GET|`/assessments/{id}`|Get assessment state|
+@@ -132,7 +132,7 @@ FastAPI does not implement its own password management or token generation.
+ 
+ This is the proposed MVP endpoint set. Some endpoints may be combined or simplified during implementation if that does not weaken the API contract.
+ 
+-Competency endpoints: `GET` and `POST` are implemented (Stage 9.2), `PATCH` and `archive` are planned for Stage 9.3, and `generate` is deferred to the AI stage. Details are in section 7.
++Competency endpoints: `GET` and `POST` (Stage 9.2), `PATCH` and `archive` (Stage 9.3) are implemented, and `generate` is deferred to the AI stage. Details are in section 7.
+ 
+ ## 5. Profile API
+ 
+@@ -246,17 +246,17 @@ Errors: `401`, `404 GOAL_NOT_FOUND`, `409 GOAL_ARCHIVED`, `422` (invalid id), `5
+ 
+ ## 7. Competency API
+ 
+-**Status: partly implemented.** The contract below was approved in Stage 9.0. Stage 9 delivers the **manual** competency map only.
++**Status: manual map implemented, AI generation deferred.** The contract below was approved in Stage 9.0. Stage 9 delivers the **manual** competency map only.
+ 
+ |Endpoint|Status|
+ |---|---|
+ |`GET /career-goals/{goal_id}/competencies`|**Implemented** (Stage 9.2)|
+ |`POST /career-goals/{goal_id}/competencies`|**Implemented** (Stage 9.2)|
+-|`PATCH /competencies/{competency_id}`|Planned (Stage 9.3), not available yet|
+-|`POST /competencies/{competency_id}/archive`|Planned (Stage 9.3), not available yet|
++|`PATCH /competencies/{competency_id}`|**Implemented** (Stage 9.3)|
++|`POST /competencies/{competency_id}/archive`|**Implemented** (Stage 9.3)|
+ |`POST /career-goals/{goal_id}/competencies/generate` and saving a whole map|Deferred to the AI stage|
+ 
+-The two implemented endpoints are in `backend/app/api/competencies.py`; the rules are applied by `competency_service` and the database. The data model, the rules and the database behaviour in special situations are in `DATABASE-DESIGN.md` (sections 4.3, 4.3.1 and 4.8).
++The four implemented endpoints are in `backend/app/api/competencies.py`; the rules are applied by `competency_service` and the database. The data model, the rules and the database behaviour in special situations are in `DATABASE-DESIGN.md` (sections 4.3, 4.3.1 and 4.8).
+ 
+ Conventions are those of section 6: identifiers come from the path, the user from the verified token; the request models reject unknown fields (`user_id`, `career_goal_id`, `status`, `id`); a resource of another user is indistinguishable from a missing one (`404`).
+ 
+@@ -329,15 +329,26 @@ Rules:
+ 
+ Errors: `401`, `404 GOAL_NOT_FOUND`, `409 GOAL_ARCHIVED`, `409 COMPETENCY_NAME_EXISTS`, `409 COMPETENCY_LIMIT_REACHED`, `422`, `503`, `504`.
+ 
+-### PATCH `/competencies/{competency_id}` (planned, Stage 9.3: not implemented yet)
++### PATCH `/competencies/{competency_id}` (implemented, Stage 9.3)
+ 
+ Updates one **active** competency in an **active** goal. Fields that are left out are not changed; at least one field is required. `description`, `rationale` and `category` may be `null` to clear them; `name`, `knowledge_type`, `importance`, `expected_level` and `display_order` may not be `null`. `status`, `career_goal_id` and `user_id` cannot be sent: a competency is archived only through the archive endpoint and never moves to another goal.
+ 
++Request (any subset of the fields of `POST`):
++
++```
++{
++  "importance": "critical",
++  "category": null
++}
++```
++
++Values follow the same rules as in `POST`; blank text in `description`, `rationale` or `category` also clears the field.
++
+ Response `200`: the updated competency.
+ 
+ Errors: `401`, `404 COMPETENCY_NOT_FOUND`, `409 COMPETENCY_ARCHIVED`, `409 GOAL_ARCHIVED`, `409 COMPETENCY_NAME_EXISTS`, `422`, `503`, `504`.
+ 
+-### POST `/competencies/{competency_id}/archive` (planned, Stage 9.3: not implemented yet)
++### POST `/competencies/{competency_id}/archive` (implemented, Stage 9.3)
+ 
+ Archives one active competency and returns it (`200`, status `archived`). Archiving is one-way: an archived competency is immutable and never becomes active again. Its historical assessment data is never deleted. Archiving frees one of the 50 slots and releases the name.
+ 
+@@ -764,7 +775,7 @@ Error codes of the competency endpoints. `COMPETENCY_NAME_EXISTS` and `COMPETENC
+ |409|`COMPETENCY_NAME_EXISTS`|An active competency with this name (ignoring case) already exists in the goal.|
+ |409|`COMPETENCY_LIMIT_REACHED`|The goal already has 50 active competencies.|
+ 
+-Planned for Stage 9.3 (not in use yet):
++In use since Stage 9.3 (`PATCH /competencies/{competency_id}` and `POST /competencies/{competency_id}/archive`):
+ 
+ |Status|Code|When|
+ |---|---|---|

@@ -56,6 +56,20 @@ class GoalArchivedError(AppError):
     default_message = "The career goal is archived and can no longer be changed."
 
 
+class CompetencyNotFoundError(AppError):
+    status_code = 404
+    code = "COMPETENCY_NOT_FOUND"
+    default_message = "Competency not found."
+
+
+class CompetencyArchivedError(AppError):
+    """The competency exists but is archived, so it can no longer be changed."""
+
+    status_code = 409
+    code = "COMPETENCY_ARCHIVED"
+    default_message = "The competency is archived and can no longer be changed."
+
+
 class CompetencyLimitReachedError(AppError):
     """The goal already has the maximum number of active competencies (competencies_active_limit)."""
 
