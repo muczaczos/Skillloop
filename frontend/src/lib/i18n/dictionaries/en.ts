@@ -1,0 +1,86 @@
+import type { Dictionary } from "./pl";
+
+export const en: Dictionary = {
+  common: {
+    appName: "SkillLoop",
+    loading: "Loading…",
+    retry: "Try again",
+    language: "Language",
+  },
+  nav: {
+    label: "Main navigation",
+    dashboard: "Dashboard",
+    signOut: "Sign out",
+    signingOut: "Signing out…",
+  },
+  auth: {
+    tagline: "Your personal career knowledge coach",
+    email: "Email address",
+    password: "Password",
+    confirmPassword: "Repeat password",
+    passwordHint: "At least 6 characters.",
+    login: {
+      title: "Sign in",
+      submit: "Sign in",
+      submitting: "Signing in…",
+      switchPrompt: "No account yet?",
+      switchLink: "Create one",
+    },
+    register: {
+      title: "Create an account",
+      submit: "Create account",
+      submitting: "Creating account…",
+      switchPrompt: "Already have an account?",
+      switchLink: "Sign in",
+      checkEmail:
+        "Check your inbox and confirm your email address to finish registration. Then sign in.",
+    },
+    sessionExpired: "Your session has expired. Please sign in again.",
+    validation: {
+      emailRequired: "Enter your email address.",
+      emailInvalid: "Enter a valid email address.",
+      passwordRequired: "Enter your password.",
+      passwordTooShort: "The password must have at least 6 characters.",
+      passwordMismatch: "The passwords do not match.",
+    },
+    errors: {
+      invalidCredentials: "Incorrect email or password.",
+      userExists: "An account with this email address already exists.",
+      weakPassword: "The password is too weak.",
+      emailNotConfirmed: "Confirm your email address first.",
+      emailInvalid: "This email address was not accepted.",
+      rateLimit: "Too many attempts. Wait a moment and try again.",
+      network: "The sign-in service cannot be reached. Please try again.",
+      unknown: "That did not work. Please try again.",
+      signOut: "Signing out failed. Please try again.",
+    },
+  },
+  dashboard: {
+    title: "Dashboard",
+    account: "Your account",
+    email: "Email",
+    displayName: "Name",
+    displayNameEmpty: "Not set",
+    memberSince: "Member since",
+    comingSoonTitle: "More is coming",
+    comingSoonText: "Career goals and competencies will arrive in the next stages.",
+  },
+  apiErrors: {
+    title: "The data could not be loaded",
+    unauthorized: "Your session has expired. Please sign in again.",
+    unavailable: "The service is temporarily unavailable. Please try again shortly.",
+    network: "The application server cannot be reached. Check that it is running and try again.",
+    timeout: "The application server did not answer in time. Please try again.",
+    profileNotFound: "No profile was found for this account.",
+    generic: "Something went wrong. Please try again.",
+    requestId: "Request id",
+  },
+  notFound: {
+    title: "This page does not exist",
+    back: "Back to the application",
+  },
+  config: {
+    title: "The application is not configured",
+    text: "Public environment variables are missing or invalid. See the .env.example file.",
+  },
+};
