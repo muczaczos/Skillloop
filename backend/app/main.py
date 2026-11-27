@@ -8,10 +8,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import career_goals, competencies, health, profile
 from app.api.errors import register_error_handlers
+from app.api.middleware import UnhandledErrorMiddleware
 from app.core.config import settings
+from app.core.logging import configure_logging
 from app.db.pool import STARTUP_WAIT_SECONDS, create_pool, wait_until_ready
 
 API_PREFIX = "/api/v1"
+
+configure_logging()
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +87,9 @@ app = FastAPI(
 # Every error response of the API goes through these handlers (docs/API-DESIGN.md, section 13).
 register_error_handlers(app)
 
+# Order matters: the middleware added last is the outermost one. CORS must stay outside, so that
+# the browser can also read the 500 of an unexpected exception.
+app.add_middleware(UnhandledErrorMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,

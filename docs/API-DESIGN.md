@@ -766,7 +766,13 @@ Error codes in use:
 |422|`VALIDATION_ERROR`|Invalid request; `details` lists the problems.|
 |503|`SERVICE_UNAVAILABLE`|The database or the keys used to verify tokens are temporarily unavailable.|
 |504|`DATABASE_TIMEOUT`|The database exceeded its statement timeout. Possible on every endpoint that uses the database.|
-|500|`INTERNAL_ERROR`|An unexpected database failure. The response for other unhandled exceptions is not yet specified.|
+|500|`INTERNAL_ERROR`|An unexpected database failure or any other unhandled exception.|
+
+An unhandled exception is turned into this response by a middleware placed inside the CORS
+middleware, so browsers can read it. The response never describes the exception. The server log
+holds the `request_id`, the method, the route template and the exception class names with code
+locations; it never holds exception messages, headers or request data
+(`backend/app/api/middleware.py`).
 
 Error codes of the competency endpoints. `COMPETENCY_NAME_EXISTS` and `COMPETENCY_LIMIT_REACHED` are in use since Stage 9.2 (`POST /career-goals/{goal_id}/competencies`):
 
