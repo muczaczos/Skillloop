@@ -18,6 +18,8 @@ services:
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:3000}
       SUPABASE_URL: ${SUPABASE_URL:?SUPABASE_URL is required - set it in .env (see .env.example)}
       SUPABASE_JWT_AUDIENCE: ${SUPABASE_JWT_AUDIENCE:-authenticated}
+      # Optional. Empty means: derived from SUPABASE_URL (see .env.example).
+      SUPABASE_JWKS_URL: ${SUPABASE_JWKS_URL:-}
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required - set it in .env (see .env.example)}
     ports:
       - "8000:8000"

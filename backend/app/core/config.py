@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     supabase_url: str
     # Expected "aud" claim of Supabase access tokens.
     supabase_jwt_audience: str = "authenticated"
+    # Where the public signing keys (JWKS) are downloaded from. Leave empty to derive it from
+    # SUPABASE_URL. Set it only when the backend reaches Supabase under another address than the
+    # one in the "iss" claim, e.g. a container calling a local stack on host.docker.internal.
+    # It does not change the expected issuer.
+    supabase_jwks_url: str = ""
 
     # PostgreSQL connection string of the Supavisor SESSION pooler, logging in as the
     # dedicated skillloop_api role (required). It is a secret: never log or print it.
@@ -64,6 +69,20 @@ class Settings(BaseSettings):
             raise ValueError("SUPABASE_URL must be an http(s) URL")
         return value
 
+    @field_validator("supabase_jwks_url")
+    @classmethod
+    def _validate_jwks_url(cls, value: str) -> str:
+        value = value.strip()
+        if value and not value.startswith(("https://", "http://")):
+            raise ValueError("SUPABASE_JWKS_URL must be an http(s) URL")
+        return value
+
+    @model_validator(mode="after")
+    def _default_jwks_url(self) -> "Settings":
+        if not self.supabase_jwks_url:
+            self.supabase_jwks_url = f"{self.supabase_jwt_issuer}/.well-known/jwks.json"
+        return self
+
     @property
     def cors_origins(self) -> list[str]:
         return [o.strip() for o in self.backend_cors_origins.split(",") if o.strip()]
@@ -72,11 +91,6 @@ class Settings(BaseSettings):
     def supabase_jwt_issuer(self) -> str:
         """Value of the "iss" claim in tokens issued by Supabase Auth."""
         return f"{self.supabase_url}/auth/v1"
-
-    @property
-    def supabase_jwks_url(self) -> str:
-        """Endpoint publishing the public keys used to verify Supabase access tokens."""
-        return f"{self.supabase_jwt_issuer}/.well-known/jwks.json"
 
 
 settings = Settings()

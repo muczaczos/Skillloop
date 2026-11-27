@@ -2,6 +2,12 @@ import pytest
 from pydantic import ValidationError
 
 from app.core.config import Settings
+from app.core.security import create_token_verifier
+
+
+@pytest.fixture(autouse=True)
+def _no_jwks_override_from_the_shell(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SUPABASE_JWKS_URL", raising=False)
 
 
 def test_supabase_urls_are_derived_from_project_url() -> None:
@@ -11,6 +17,47 @@ def test_supabase_urls_are_derived_from_project_url() -> None:
     assert settings.supabase_jwt_issuer == "https://abc.supabase.co/auth/v1"
     assert settings.supabase_jwks_url == "https://abc.supabase.co/auth/v1/.well-known/jwks.json"
     assert settings.supabase_jwt_audience == "authenticated"
+
+
+LOCAL_URL = "http://127.0.0.1:54321"
+LOCAL_JWKS_URL = "http://host.docker.internal:54321/auth/v1/.well-known/jwks.json"
+
+
+def test_jwks_url_can_be_set_without_changing_the_issuer() -> None:
+    settings = Settings(supabase_url=LOCAL_URL, supabase_jwks_url=f"  {LOCAL_JWKS_URL}  ")
+
+    assert settings.supabase_jwks_url == LOCAL_JWKS_URL
+    assert settings.supabase_jwt_issuer == f"{LOCAL_URL}/auth/v1"
+
+
+def test_jwks_url_is_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUPABASE_JWKS_URL", LOCAL_JWKS_URL)
+
+    assert Settings(supabase_url=LOCAL_URL).supabase_jwks_url == LOCAL_JWKS_URL
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_empty_jwks_url_means_derived(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    # Docker Compose passes an unset optional variable as an empty string.
+    monkeypatch.setenv("SUPABASE_JWKS_URL", value)
+
+    settings = Settings(supabase_url=LOCAL_URL)
+
+    assert settings.supabase_jwks_url == f"{LOCAL_URL}/auth/v1/.well-known/jwks.json"
+
+
+def test_jwks_url_must_be_http_url() -> None:
+    with pytest.raises(ValidationError, match="SUPABASE_JWKS_URL"):
+        Settings(supabase_url=LOCAL_URL, supabase_jwks_url="host.docker.internal:54321/jwks.json")
+
+
+def test_token_verifier_downloads_keys_from_the_configured_jwks_url() -> None:
+    settings = make_settings(supabase_url=LOCAL_URL, supabase_jwks_url=LOCAL_JWKS_URL)
+
+    verifier = create_token_verifier(settings)
+
+    assert verifier._jwks_client.uri == LOCAL_JWKS_URL
+    assert verifier._issuer == f"{LOCAL_URL}/auth/v1"
 
 
 def test_supabase_url_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
